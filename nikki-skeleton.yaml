@@ -1,0 +1,574 @@
+# ==============================================================
+# Nikki 旁路由骨架配置 v1.0（GitHub 公开托管版）
+# 生成日期: 2026-11-16 ｜ 零敏感信息，可公开托管
+#
+# 【与完整版的唯一差异】
+#   本文件去掉了 proxy-providers 段（含机场订阅 token 的部分）——
+#   订阅由 Nikki 的本地 mixin 文件注入（见"本地mixin-订阅.yaml"）。
+#   其余内容与 nikki-config.yaml 完全一致。
+#
+# 【托管方式】
+#   GitHub 公开仓库随意放（零敏感信息）。
+#   Nikki 订阅 URL 建议用 jsDelivr CDN 地址（国内直连稳定，
+#   首次启动节点未就绪时也能直连拉取成功）：
+#   https://fastly.jsdelivr.net/gh/你的用户名/仓库名@main/骨架文件名.yaml
+#   急用最新版时把 @main 换成具体 commit 编号绕过 12h 缓存。
+#
+# 【更新流程】
+#   改规则 → GitHub 网页编辑此文件 → Nikki 界面 Profile → 订阅 →
+#   点"更新" → 重载服务。换机场不碰本文件（只改本地 mixin）。
+# ==============================================================
+
+mixed-port: 7890
+allow-lan: true
+bind-address: '*'
+mode: rule
+log-level: info
+unified-delay: true
+tcp-concurrent: true
+external-controller: 0.0.0.0:9090
+find-process-mode: strict
+global-ua: chrome
+
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+geox-url:
+  geoip: 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat'
+  geosite: 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat'
+  mmdb: 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/country.mmdb'
+  asn: 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb'
+
+# -------------------- DNS（AGH 上游 = 本段） --------------------
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  ipv6: true
+  prefer-h3: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter-mode: blacklist
+  fake-ip-filter:
+    - 'rule-set:private'
+    - 'rule-set:cn_domain'
+    - 'rule-set:connectivity_check'
+    - '+.lan'
+    - '+.local'
+    - '+.msftconnecttest.com'
+    - '+.msftncsi.com'
+  respect-rules: true
+  proxy-server-nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  direct-nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - https://1.1.1.1/dns-query
+    - https://8.8.8.8/dns-query
+  nameserver-policy:
+    'rule-set:cn_domain,private':
+      - https://dns.alidns.com/dns-query
+      - https://doh.pub/dns-query
+
+# -------------------- 域名嗅探 --------------------
+sniffer:
+  enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
+  sniff:
+    HTTP:
+      ports: [80, 8080-8880]
+      override-destination: true
+    TLS:
+      ports: [443, 8443]
+    QUIC:
+      ports: [443, 8443]
+  skip-domain:
+    - '+.push.apple.com'
+    - 'Mijia Cloud'
+
+# ==================== 策略组（23+2 个） ====================
+proxy-groups:
+  - name: '🚀 节点选择'
+    type: select
+    proxies:
+      - '♻️ 自动选择'
+      - '🔯 香港节点'
+      - '🇯🇵 日本节点'
+      - '🇸🇬 新加坡节点'
+      - '🇺🇸 美国节点'
+      - '🇹🇼 台湾节点'
+      - '🇰🇷 韩国节点'
+      - '🌐 其他地区'
+      - DIRECT
+    use:
+      - SMJC
+
+  - name: '♻️ 自动选择'
+    type: url-test
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    use:
+      - SMJC
+    exclude-filter: '建议|订阅|官网|流量|到期|套餐'
+
+  - name: '🔯 香港节点'
+    type: url-test
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    use:
+      - SMJC
+    filter: '香港'
+    exclude-filter: '建议|订阅|官网|流量|到期|套餐'
+
+  - name: '🇯🇵 日本节点'
+    type: url-test
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    use:
+      - SMJC
+    filter: '日本'
+    exclude-filter: '建议|订阅|官网|流量|到期|套餐'
+
+  - name: '🇸🇬 新加坡节点'
+    type: url-test
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    use:
+      - SMJC
+    filter: '新加坡'
+    exclude-filter: '建议|订阅|官网|流量|到期|套餐'
+
+  - name: '🇺🇸 美国节点'
+    type: url-test
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    use:
+      - SMJC
+    filter: '美国'
+    exclude-filter: '建议|订阅|官网|流量|到期|套餐'
+
+  - name: '🇹🇼 台湾节点'
+    type: url-test
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    use:
+      - SMJC
+    filter: '台湾'
+    exclude-filter: '建议|订阅|官网|流量|到期|套餐'
+
+  - name: '🇰🇷 韩国节点'
+    type: url-test
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    use:
+      - SMJC
+    filter: '韩国'
+    exclude-filter: '建议|订阅|官网|流量|到期|套餐'
+
+  - name: '🌐 其他地区'
+    type: url-test
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    use:
+      - SMJC
+    filter: '英国|加拿大|卢森堡'
+    exclude-filter: '建议|订阅|官网|流量|到期|套餐'
+
+  - name: '🤖 AI服务'
+    type: select
+    proxies:
+      - '🇺🇸 美国节点'
+      - '🚀 节点选择'
+      - '🇯🇵 日本节点'
+      - '🇸🇬 新加坡节点'
+      - '🔯 香港节点'
+      - '🌐 其他地区'
+      - DIRECT
+
+  - name: '📱 Telegram'
+    type: select
+    proxies:
+      - '🚀 节点选择'
+      - '♻️ 自动选择'
+      - '🔯 香港节点'
+      - '🇸🇬 新加坡节点'
+      - '🇯🇵 日本节点'
+      - '🇺🇸 美国节点'
+
+  - name: '📺 Netflix'
+    type: select
+    proxies:
+      - '🚀 节点选择'
+      - '🔯 香港节点'
+      - '🇯🇵 日本节点'
+      - '🇸🇬 新加坡节点'
+      - '🇺🇸 美国节点'
+      - '🇹🇼 台湾节点'
+
+  - name: '🎬 Disney+'
+    type: select
+    proxies:
+      - '🚀 节点选择'
+      - '🔯 香港节点'
+      - '🇯🇵 日本节点'
+      - '🇸🇬 新加坡节点'
+      - '🇺🇸 美国节点'
+      - '🇹🇼 台湾节点'
+
+  - name: '🎥 Prime Video'
+    type: select
+    proxies:
+      - '🚀 节点选择'
+      - '🔯 香港节点'
+      - '🇯🇵 日本节点'
+      - '🇸🇬 新加坡节点'
+      - '🇺🇸 美国节点'
+      - '🇹🇼 台湾节点'
+
+  - name: '▶️ YouTube'
+    type: select
+    proxies:
+      - '🚀 节点选择'
+      - '♻️ 自动选择'
+      - '🔯 香港节点'
+      - '🇯🇵 日本节点'
+      - '🇸🇬 新加坡节点'
+      - '🇺🇸 美国节点'
+
+  - name: '🎵 Spotify'
+    type: select
+    proxies:
+      - '🚀 节点选择'
+      - '♻️ 自动选择'
+      - '🔯 香港节点'
+      - '🇯🇵 日本节点'
+      - '🇸🇬 新加坡节点'
+      - '🇺🇸 美国节点'
+
+  - name: '🎵 TikTok'
+    type: select
+    proxies:
+      - '🚀 节点选择'
+      - '🇯🇵 日本节点'
+      - '🇸🇬 新加坡节点'
+      - '🇺🇸 美国节点'
+      - '🔯 香港节点'
+      - '🇹🇼 台湾节点'
+
+  - name: '📺 B站'
+    type: select
+    proxies:
+      - DIRECT
+      - '🔯 香港节点'
+      - '🇹🇼 台湾节点'
+      - '🚀 节点选择'
+
+  - name: '𝕏 Twitter'
+    type: select
+    proxies:
+      - '🚀 节点选择'
+      - '♻️ 自动选择'
+      - '🔯 香港节点'
+      - '🇯🇵 日本节点'
+      - '🇺🇸 美国节点'
+
+  - name: 'Ⓜ️ 微软服务'
+    type: select
+    proxies:
+      - DIRECT
+      - '🚀 节点选择'
+      - '🔯 香港节点'
+      - '🇯🇵 日本节点'
+
+  - name: '🍎 苹果服务'
+    type: select
+    proxies:
+      - DIRECT
+      - '🚀 节点选择'
+      - '🔯 香港节点'
+
+  - name: '🔍 谷歌服务'
+    type: select
+    proxies:
+      - '🚀 节点选择'
+      - '♻️ 自动选择'
+      - '🔯 香港节点'
+      - '🇯🇵 日本节点'
+      - '🇸🇬 新加坡节点'
+      - '🇺🇸 美国节点'
+
+  - name: '🎮 游戏平台'
+    type: select
+    proxies:
+      - DIRECT
+      - '🚀 节点选择'
+
+  - name: '🇨🇳 国内直连'
+    type: select
+    proxies:
+      - DIRECT
+      - '🚀 节点选择'
+
+  - name: '🐟 漏网之鱼'
+    type: select
+    proxies:
+      - '🚀 节点选择'
+      - DIRECT
+
+# ==================== 动态规则集（23 个，广告已移交 AGH） ====================
+rule-providers:
+  private:
+    type: http
+    behavior: domain
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/private.mrs'
+    path: ./ruleset/private.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  private_ip:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/private.mrs'
+    path: ./ruleset/private_ip.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  ai_global:
+    type: http
+    behavior: classical
+    format: yaml
+    url: 'https://raw.githubusercontent.com/VPSDance/ai-proxy-rules/main/rules/clash/global.yaml'
+    path: ./ruleset/ai_global.yaml
+    interval: 86400
+    proxy: '🚀 节点选择'
+
+  telegram:
+    type: http
+    behavior: domain
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/telegram.mrs'
+    path: ./ruleset/telegram.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  telegram_ip:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/telegram.mrs'
+    path: ./ruleset/telegram_ip.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  netflix:
+    type: http
+    behavior: domain
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/netflix.mrs'
+    path: ./ruleset/netflix.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  netflix_ip:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/netflix.mrs'
+    path: ./ruleset/netflix_ip.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  disney:
+    type: http
+    behavior: domain
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/disney.mrs'
+    path: ./ruleset/disney.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  primevideo:
+    type: http
+    behavior: domain
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/primevideo.mrs'
+    path: ./ruleset/primevideo.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  youtube:
+    type: http
+    behavior: domain
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/youtube.mrs'
+    path: ./ruleset/youtube.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  spotify:
+    type: http
+    behavior: domain
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/spotify.mrs'
+    path: ./ruleset/spotify.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  bilibili:
+    type: http
+    behavior: domain
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/bilibili.mrs'
+    path: ./ruleset/bilibili.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  tiktok:
+    type: http
+    behavior: domain
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/tiktok.mrs'
+    path: ./ruleset/tiktok.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  twitter:
+    type: http
+    behavior: domain
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/twitter.mrs'
+    path: ./ruleset/twitter.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  github:
+    type: http
+    behavior: domain
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/github.mrs'
+    path: ./ruleset/github.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  microsoft:
+    type: http
+    behavior: domain
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/microsoft.mrs'
+    path: ./ruleset/microsoft.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  apple:
+    type: http
+    behavior: domain
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/apple.mrs'
+    path: ./ruleset/apple.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  google:
+    type: http
+    behavior: domain
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/google.mrs'
+    path: ./ruleset/google.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  game_platforms:
+    type: http
+    behavior: domain
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/category-games.mrs'
+    path: ./ruleset/game_platforms.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  cn_domain:
+    type: http
+    behavior: domain
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/cn.mrs'
+    path: ./ruleset/cn_domain.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  cn_ip:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/cn.mrs'
+    path: ./ruleset/cn_ip.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  proxy_domain:
+    type: http
+    behavior: domain
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/geolocation-!cn.mrs'
+    path: ./ruleset/proxy_domain.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+  connectivity_check:
+    type: http
+    behavior: domain
+    format: mrs
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/connectivity-check.mrs'
+    path: ./ruleset/connectivity_check.mrs
+    interval: 172800
+    proxy: '🚀 节点选择'
+
+# ==================== 分流规则链（30 条） ====================
+rules:
+  - RULE-SET,private,DIRECT
+  - RULE-SET,private_ip,DIRECT,no-resolve
+
+  - DOMAIN-SUFFIX,qq.com,DIRECT
+  - DOMAIN-SUFFIX,wechat.com,DIRECT
+  - DOMAIN-SUFFIX,servicewechat.com,DIRECT
+  - DOMAIN-SUFFIX,wechatapp.com,DIRECT
+  - DOMAIN-SUFFIX,tenpay.com,DIRECT
+  - DOMAIN-SUFFIX,qpic.cn,DIRECT
+  - DOMAIN-SUFFIX,qlogo.cn,DIRECT
+
+  - RULE-SET,ai_global,🤖 AI服务
+  - RULE-SET,telegram,📱 Telegram
+  - RULE-SET,telegram_ip,📱 Telegram,no-resolve
+  - RULE-SET,netflix,📺 Netflix
+  - RULE-SET,netflix_ip,📺 Netflix
+  - RULE-SET,disney,🎬 Disney+
+  - RULE-SET,primevideo,🎥 Prime Video
+  - RULE-SET,youtube,▶️ YouTube
+  - RULE-SET,spotify,🎵 Spotify
+  - RULE-SET,bilibili,📺 B站
+  - RULE-SET,tiktok,🎵 TikTok
+  - RULE-SET,twitter,𝕏 Twitter
+  - RULE-SET,github,🚀 节点选择
+  - RULE-SET,microsoft,Ⓜ️ 微软服务
+  - RULE-SET,apple,🍎 苹果服务
+  - RULE-SET,google,🔍 谷歌服务
+  - RULE-SET,game_platforms,🎮 游戏平台
+  - RULE-SET,cn_domain,🇨🇳 国内直连
+  - RULE-SET,cn_ip,🇨🇳 国内直连,no-resolve
+  - RULE-SET,proxy_domain,🚀 节点选择
+  - MATCH,🐟 漏网之鱼

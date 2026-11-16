@@ -8,10 +8,10 @@
 #   其余内容与 nikki-config.yaml 完全一致。
 #
 # 【托管方式】
-#   GitHub 公开仓库随意放（零敏感信息）。
-#   Nikki 订阅 URL 建议用 jsDelivr CDN 地址（国内直连稳定，
-#   首次启动节点未就绪时也能直连拉取成功）：
-#   https://fastly.jsdelivr.net/gh/你的用户名/仓库名@main/骨架文件名.yaml
+#   已上传至 GitHub 公开仓库 scud3g/clash-config（零敏感信息），
+#   GitHub 上的文件名为 nikki-skeleton.yaml（英文文件名，jsDelivr 最稳）。
+#   Nikki 订阅 URL（jsDelivr CDN，国内直连稳定，已实测 HTTP 200）：
+#   https://fastly.jsdelivr.net/gh/scud3g/clash-config@main/nikki-skeleton.yaml
 #   急用最新版时把 @main 换成具体 commit 编号绕过 12h 缓存。
 #
 # 【更新流程】

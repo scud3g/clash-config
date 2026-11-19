@@ -336,14 +336,18 @@ proxy-groups:
 #   订阅在启动时深合并，整体覆盖本占位（同名同 type，后合并者胜）。
 proxy-providers:
   SMJC:
-    type: file
-    payload:
-      - name: "占位节点(将被本地mixin覆盖)"
-        type: ss
-        server: 127.0.0.1
-        port: 8388
-        cipher: aes-128-gcm
-        password: "placeholder"
+    type: http
+    url: https://example.com/placeholder-not-used
+    interval: 86400
+    path: ./providers/smjc.yaml
+    proxy: DIRECT
+    health-check:
+      enable: true
+      lazy: true
+      url: https://www.gstatic.com/generate_204
+      interval: 600
+    override:
+      udp: true
 
 # ==================== 动态规则集（23 个，广告已移交 AGH） ====================
 rule-providers:

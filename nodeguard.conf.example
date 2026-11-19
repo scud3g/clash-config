@@ -1,0 +1,11 @@
+# nodeguard.conf 示例 - 复制为 /root/nodeguard.conf 并填入真实值
+# 本文件含密钥，绝不上传任何公开位置（GitHub 只放 nodeguard.sh 本体）
+
+# mihomo external-controller 的访问密钥（对应 secret 字段）
+NG_SECRET="Bearer YOUR_MIHOMO_SECRET"
+
+# mihomo external-controller 地址（旁路由本机就写 127.0.0.1）
+NG_API="http://127.0.0.1:9090"
+
+# 要守护的策略组名（mihomo 面板里复制，含 emoji 也没关系，脚本自动编码）
+NG_GROUP_SEL="🚀 节点选择"

@@ -329,6 +329,22 @@ proxy-groups:
       - '🚀 节点选择'
       - DIRECT
 
+# ==================== 订阅占位（必需，供 Nikki 校验通过） ====================
+# ★ 说明：Nikki 校验要求下载的订阅文件必须含 proxies 或 proxy-providers。
+#   本骨架为 A 方案分离式设计（机场 token 不放公开仓库），故用此占位 provider
+#   通过 has("proxy-providers") 校验。真实节点由 /etc/nikki/mixin.yaml 的 SMJC
+#   订阅在启动时深合并，整体覆盖本占位（同名同 type，后合并者胜）。
+proxy-providers:
+  SMJC:
+    type: file
+    payload:
+      - name: "占位节点(将被本地mixin覆盖)"
+        type: ss
+        server: 127.0.0.1
+        port: 8388
+        cipher: aes-128-gcm
+        password: "placeholder"
+
 # ==================== 动态规则集（23 个，广告已移交 AGH） ====================
 rule-providers:
   private:
@@ -572,3 +588,4 @@ rules:
   - RULE-SET,cn_ip,🇨🇳 国内直连,no-resolve
   - RULE-SET,proxy_domain,🚀 节点选择
   - MATCH,🐟 漏网之鱼
+

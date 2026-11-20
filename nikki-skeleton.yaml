@@ -116,7 +116,7 @@ proxy-groups:
     tolerance: 50
     use:
       - SMJC
-    exclude-filter: '建议|订阅|官网|流量|到期|套餐'
+    exclude-filter: '建议|订阅|官网|剩余|重置|到期|套餐'
 
   - name: '🔯 香港节点'
     type: url-test
@@ -126,7 +126,7 @@ proxy-groups:
     use:
       - SMJC
     filter: '香港'
-    exclude-filter: '建议|订阅|官网|流量|到期|套餐'
+    exclude-filter: '建议|订阅|官网|剩余|重置|到期|套餐'
 
   - name: '🇯🇵 日本节点'
     type: url-test
@@ -136,7 +136,7 @@ proxy-groups:
     use:
       - SMJC
     filter: '日本'
-    exclude-filter: '建议|订阅|官网|流量|到期|套餐'
+    exclude-filter: '建议|订阅|官网|剩余|重置|到期|套餐'
 
   - name: '🇸🇬 新加坡节点'
     type: url-test
@@ -146,7 +146,7 @@ proxy-groups:
     use:
       - SMJC
     filter: '新加坡'
-    exclude-filter: '建议|订阅|官网|流量|到期|套餐'
+    exclude-filter: '建议|订阅|官网|剩余|重置|到期|套餐'
 
   - name: '🇺🇸 美国节点'
     type: url-test
@@ -156,7 +156,7 @@ proxy-groups:
     use:
       - SMJC
     filter: '美国'
-    exclude-filter: '建议|订阅|官网|流量|到期|套餐'
+    exclude-filter: '建议|订阅|官网|剩余|重置|到期|套餐'
 
   - name: '🇹🇼 台湾节点'
     type: url-test
@@ -166,7 +166,7 @@ proxy-groups:
     use:
       - SMJC
     filter: '台湾'
-    exclude-filter: '建议|订阅|官网|流量|到期|套餐'
+    exclude-filter: '建议|订阅|官网|剩余|重置|到期|套餐'
 
   - name: '🇰🇷 韩国节点'
     type: url-test
@@ -176,7 +176,7 @@ proxy-groups:
     use:
       - SMJC
     filter: '韩国'
-    exclude-filter: '建议|订阅|官网|流量|到期|套餐'
+    exclude-filter: '建议|订阅|官网|剩余|重置|到期|套餐'
 
   - name: '🌐 其他地区'
     type: url-test
@@ -186,7 +186,7 @@ proxy-groups:
     use:
       - SMJC
     filter: '英国|加拿大|卢森堡'
-    exclude-filter: '建议|订阅|官网|流量|到期|套餐'
+    exclude-filter: '建议|订阅|官网|剩余|重置|到期|套餐'
 
   - name: '🤖 AI服务'
     type: select

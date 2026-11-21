@@ -2,7 +2,9 @@
 # selfupdate.sh - nodeguard.sh 每日自动同步（方案A：GitHub 为唯一权威源）
 # 逻辑：从 GitHub raw 拉最新 nodeguard.sh → md5 对比 → 不同才覆盖（先备份旧版）
 # 安全性：语法校验失败不部署；拉取失败保持原状；备份保留最近 3 份；
-#         部署前抢 nodeguard 单实例锁，nodeguard 运行中则顺延（防 05:10 同刻碰撞覆写运行中脚本）
+#         部署前抢 nodeguard 单实例锁，nodeguard 运行中则顺延（防 05:10 同刻碰撞覆写运行中脚本）；
+#         v3 版本哨兵：拉取内容版本号低于本地版拒部署，防 CDN 过期缓存把线上回滚到旧版
+#         （2026-11-21 实测：CDN 给 v7 权重内容时 v2 会把 v8.1 回滚成 v7）
 # cron: 每日 05:10（错开 4:00 nikki 重启与 5 分钟一轮的 nodeguard 整点检查）
 
 RAW_URL="https://raw.githubusercontent.com/scud3g/clash-config/main/nodeguard.sh"
@@ -28,6 +30,17 @@ sh -n "$TMP" 2>/dev/null || { log "SKIP 语法校验失败，保持现版本"; r
 NEW_MD5=$(md5sum "$TMP" | cut -d' ' -f1)
 OLD_MD5=$(md5sum "$TARGET" 2>/dev/null | cut -d' ' -f1)
 [ "$NEW_MD5" = "$OLD_MD5" ] && exit 0   # 无变化，静默退出（不记日志防噪音）
+
+# ---- v3 版本哨兵：只允许升级/同级补丁，拒绝回退 ----
+# 从文件头提取 "nodeguard.sh vX"（v8/v8.1/v9 等），取主版本号比较
+ver_major() { head -5 "$1" 2>/dev/null | grep -o 'nodeguard.sh v[0-9]*' | head -1 | sed 's/.*v//'; }
+NEW_V=$(ver_major "$TMP")
+OLD_V=$(ver_major "$TARGET")
+if [ -n "$NEW_V" ] && [ -n "$OLD_V" ] && [ "$NEW_V" -lt "$OLD_V" ] 2>/dev/null; then
+  log "SKIP 拉取内容为旧版v$NEW_V（本地v$OLD_V），疑似CDN过期，拒回滚"
+  rm -f "$TMP"
+  exit 0
+fi
 
 # ---- 部署前护栏：抢 nodeguard 单实例锁 ----
 # nodeguard 正在运行（尤其竞速中段）时，其 flock 持有 /tmp/nodeguard.single；

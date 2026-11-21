@@ -209,7 +209,7 @@ function main(config) {
     { name: '🎮 游戏平台', type: 'select', proxies: ['DIRECT', '🚀 节点选择'] },
     { name: '🇨🇳 国内直连', type: 'select', proxies: ['DIRECT', '🚀 节点选择'] },
     { name: '🛑 广告拦截', type: 'select', proxies: ['REJECT', 'DIRECT', '🚀 节点选择'] },
-    { name: '🐟 漏网之鱼', type: 'select', proxies: ['🚀 节点选择', 'DIRECT'] }
+    { name: '🐟 漏网之鱼', type: 'select', proxies: ['DIRECT', '🚀 节点选择'] }
   ];
 
   // ---------------- 分流规则链(顺序即去重, 上方优先) ----------------

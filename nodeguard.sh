@@ -116,6 +116,7 @@ FAIL_N=0
 if [ -f $STATE ]; then
   SV=$(cat $STATE)
   case "$SV" in v8:*) FAIL_N=${SV#v8:} ;; esac
+  case "$FAIL_N" in ''|*[!0-9]*) FAIL_N=0 ;; esac   # 容错：非法值(如误写xyz)归零，防算术乱算
 fi
 
 curl -s -m 5 -H "$AH" "$API/version" >/dev/null 2>&1 || { log "WARN mihomo 不可达跳过"; exit 0; }

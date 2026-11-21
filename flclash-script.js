@@ -1,6 +1,9 @@
 // ==============================================================
-// FlClash 扩展脚本（脚本模式）· 完整动态分流 v1.0
+// FlClash 扩展脚本（脚本模式）· 完整动态分流 v1.1
 // 生成: 2026-11-16 | 适配: FlClash 脚本模式 (mihomo v1.19.33 内核)
+// v1.1 (2026-11-21 三轮代码审查): 修复 geoip/geosite 同名 .mrs 缓存互覆（四对规则集 path 碰撞，
+//   ipcidr 版改存 _ip 后缀与 nikki 统一）；EXCLUDE 补 剩余|重置；Prime Video 统一为 🎥；
+//   DNS 监听 0.0.0.0→127.0.0.1；注释计数修正（规则集 25 / 策略组 26）
 //
 // 【用途】把本脚本添加到 FlClash「配置脚本」，然后:
 //   配置 → 右键你的机场订阅 → 拓展 → 模式选「脚本」→ 扩展脚本选本脚本 → 立即应用
@@ -37,7 +40,7 @@ function main(config) {
   // ---------------- DNS 防污染防泄漏 ----------------
   config['dns'] = {
     enable: true,
-    listen: '0.0.0.0:1053',
+    listen: '127.0.0.1:1053',
     ipv6: true,
     'prefer-h3': false,
     'enhanced-mode': 'fake-ip',
@@ -92,14 +95,15 @@ function main(config) {
 
   // ---------------- 24 个动态规则集(全部远程引用+自动更新) ----------------
   var RAW = 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/';
-  var EXCLUDE = '建议|订阅|官网|流量|到期|套餐';
+  var EXCLUDE = '建议|订阅|官网|流量|到期|套餐|剩余|重置';
   function mrs(behavior, url, interval) {
+    // v1.1: path 加 _ip 后缀防 geoip/geosite 同名互覆（与 nikki-skeleton 命名一致）
     return {
       type: 'http',
       behavior: behavior,
       format: 'mrs',
       url: url,
-      path: './ruleset/' + url.split('/').pop(),
+      path: './ruleset/' + url.split('/').pop().replace(/\.mrs$/, (behavior === 'ipcidr' ? '_ip' : '') + '.mrs'),
       interval: interval || 172800,
       proxy: '🚀 节点选择'
     };
@@ -192,7 +196,7 @@ function main(config) {
     { name: '🤖 AI服务', type: 'select', proxies: ['🇺🇸 美国节点', '🚀 节点选择', '🇯🇵 日本节点', '🇸🇬 新加坡节点', '🔯 香港节点', '🌐 其他地区', 'DIRECT'] },
     { name: '📱 Telegram', type: 'select', proxies: ['🚀 节点选择', '♻️ 自动选择', '🔯 香港节点', '🇸🇬 新加坡节点', '🇯🇵 日本节点', '🇺🇸 美国节点'] },
     { name: '📺 Netflix', type: 'select', proxies: ['🚀 节点选择', '🔯 香港节点', '🇯🇵 日本节点', '🇸🇬 新加坡节点', '🇺🇸 美国节点', '🇹🇼 台湾节点'] },
-    { name: '📺 Prime Video', type: 'select', proxies: ['🚀 节点选择', '🔯 香港节点', '🇯🇵 日本节点', '🇸🇬 新加坡节点', '🇺🇸 美国节点', '🇹🇼 台湾节点'] },
+        { name: '📺 Prime Video', type: 'select', proxies: ['🚀 节点选择', '🔯 香港节点', '🇯🇵 日本节点', '🇸🇬 新加坡节点', '🇺🇸 美国节点', '🇹🇼 台湾节点'] },
     { name: '🎬 Disney+', type: 'select', proxies: ['🚀 节点选择', '🔯 香港节点', '🇯🇵 日本节点', '🇸🇬 新加坡节点', '🇺🇸 美国节点', '🇹🇼 台湾节点'] },
     { name: '▶️ YouTube', type: 'select', proxies: ['🚀 节点选择', '♻️ 自动选择', '🔯 香港节点', '🇯🇵 日本节点', '🇸🇬 新加坡节点', '🇺🇸 美国节点'] },
     { name: '🎵 Spotify', type: 'select', proxies: ['🚀 节点选择', '♻️ 自动选择', '🔯 香港节点', '🇯🇵 日本节点', '🇸🇬 新加坡节点', '🇺🇸 美国节点'] },

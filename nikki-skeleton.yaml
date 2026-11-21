@@ -326,8 +326,8 @@ proxy-groups:
   - name: '🐟 漏网之鱼'
     type: select
     proxies:
-      - '🚀 节点选择'
       - DIRECT
+      - '🚀 节点选择'
 
 # ==================== 订阅占位（必需，供 Nikki 校验通过） ====================
 # ★ 说明：Nikki 校验要求下载的订阅文件必须含 proxies 或 proxy-providers。

@@ -1,13 +1,34 @@
 #!/bin/sh
 # ============================================================
-# nodeguard.sh v9.0 - merged debounce edition
-# Base: v8.1 production flow (kept, battle-tested)
-# Added: time-window trigger, race cooldown, ledger, manual-off
-#        switch, shadow mode, 3-dim scoring, spike confirmation,
-#        persistent log, TRAP rollback, cur-first race
-# v9.1: zero-download google probe (M4), rolling hourly race
+# nodeguard.sh v9.2 - merged debounce edition
+# Base: v9.1+ (486 lines / 64264e27, production since 2026-11-23)
+# v9.2 fixes (external review items, each re-verified live before applying):
+#  F1 now_ok hardening: exact JSON field parse (grep -o) instead of
+#     greedy sed; HTML / truncated / 502 pages now yield empty -> reject.
+#     Length cap + reject control chars and quote/brace. SPACES ARE
+#     ALLOWED: real provider nodes contain spaces, verified live
+#     ("韩国 cdn|电信高速|2倍率"). Never blacklist spaces.
+#  F2 on_exit captures put_node result; never log "restored" on fail.
+#  F3 lock stale 10min -> 4min (cron is 5min; avoid losing 2 rounds).
+#  F4 speed_med: zeros count into median; <2 nonzero samples -> 0
+#     (single lucky sample can no longer pass a slow node).
+#  F5 group-name subtraction from /proxies. Verified: /proxies holds
+#     ONLY groups+builtins (32 entries), zero provider nodes, because
+#     provider nodes never enter tunnel.Proxies(). Authoritative group
+#     set, works even when providers API is down.
+#  F6 GOOGLE_URL http -> https (both 204, verified live).
+#  F7 health gate uses LOWER of two samples (was HIGHER) - same
+#     conservative direction as race median; no extra traffic.
+#  F8 PREV_BPS persisted to state line 4 (spike no longer depends on
+#     log retention); missing 4th line -> PREV_BPS=0 (old state ok).
+#  F9 PROV_TYPES whitelist completed from constant_adapters.go.
+#  F10 NG_OFF sandboxable + runtime assert: SEL must be Selector
+#      (if group type changes, stage-1 group delay would unpin -> refuse).
+#  F11 in-loop TERM checkpoint before speed_med in candidate loop.
+# v9.2: F1-F11 (see header). Decision logic itself is unchanged.
 #        budget hard ceiling (B2), type-based candidate filter
 #        from providers API (M5)
+# v9.2: see F1-F11 above. All decisions logic unchanged.
 # Stage1 screen: /group/{SEL}/delay (no unpin side effect,
 #        no per-switch jitter; per-node /proxies/{n}/delay is NOT
 #        usable here: provider nodes never register in tunnel
@@ -49,28 +70,42 @@ W_LAT=${W_LAT:-30}               # lat weight
 W_THR=${W_THR:-60}               # throughput weight
 W_STAB=${W_STAB:-10}             # stability weight
 SPEED_URL="${SPEED_URL:-https://i.ytimg.com/vi/aqz-KE-bpKQ/maxresdefault.jpg}"
-PROV_TYPES="${PROV_TYPES:-AnyTLS|Hysteria2|Trojan|Vless|Vmess|Shadowsocks|ShadowsocksR|Socks5|Http|Ssh|Tuic|WireGuard|Mieru}"
+PROV_TYPES="${PROV_TYPES:-AnyTLS|Hysteria2|Hysteria|Trojan|Vless|Vmess|Shadowsocks|ShadowsocksR|Socks5|Http|Ssh|Tuic|WireGuard|Mieru|Snell|Sudoku|Masque|TrustTunnel|ShadowQuic|OpenVPN|Tailscale|ZeroTier|EasyTier|GostRelay}"
 DRY_RUN=${NG_DRY_RUN:-0}
 
 # v9 paths (shadow install overrides STATE/LOG via conf)
 STATE="${NG_STATE:-/root/.nodeguard.state}"
 LOG="${NG_LOG:-/root/nodeguard.log}"
-LOCK_DIR=/tmp/nodeguard_v9.lock
+LOCK_DIR="${NG_LOCK:-/tmp/nodeguard_v9.lock}"   # F12: sandboxable lock (default unchanged)
+OFFFILE="${NG_OFF:-/root/.nodeguard.off}"   # F10: sandboxable
 log(){ echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG"; }
 # log trim (v8.1 rule: 200KB cap, keep last 100 lines)
 [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 204800 ] && tail -100 "$LOG" > "$LOG.new" && mv "$LOG.new" "$LOG"
 
-# ---- single instance lock (mkdir + stale guard > 10min) ----
-mkdir "$LOCK_DIR" 2>/dev/null || { log "SKIP another instance running"; exit 0; }
-OLD=$(find "$LOCK_DIR" -mmin +10 2>/dev/null)
+# ---- single instance lock (mkdir + stale guard > 4min) ----
+# F3: cron period is 5min; a 10min stale window loses 2 rounds.
+mkdir "$LOCK_DIR" 2> /dev/null || { log "SKIP another instance running"; exit 0; }
+OLD=$(find "$LOCK_DIR" -mmin +4 2>/dev/null)
 if [ -n "$OLD" ]; then rm -rf "$LOCK_DIR"; mkdir "$LOCK_DIR" 2>/dev/null || exit 0; fi
 trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT INT TERM HUP
 
 # ---- helpers ----
 enc(){ printf "%s" "$1" | awk 'BEGIN{for(i=0;i<256;i++)o[sprintf("%c",i)]=i}{n=length($0);for(i=1;i<=n;i++){c=substr($0,i,1);if(c~/[A-Za-z0-9._~-]/)printf"%s",c;else printf"%%%02X",o[c]}}'; }
-get_now(){ curl -s -m 5 -H "$AH" "$API/proxies/$(enc "$SEL")" | sed 's/.*"now":"//;s/".*//'; }
-# validate selector output: garbage ({, }, not-found msg, empty) -> fail
-now_ok(){ case "$1" in ""|"{"|"}"|"{"*"}"*|*'"now"'*|*"not exist"*|*"error"*) return 1 ;; *) return 0 ;; esac; }
+get_now(){ curl -s -m 5 -H "$AH" "$API/proxies/$(enc "$SEL")" | tr ',' '\n' | grep -o '"now":"[^"]*"' | head -n1 | sed 's/^"now":"//; s/"$//'; }
+# F1: exact JSON field parse replaces greedy sed. Verified live: an HTML
+# 502 page, {"error":...}, {"now":""} all yield an empty string now.
+# Keep a defensive blacklist on top (defense in depth): a truncated JSON with
+# an escaped quote leaves a trailing backslash ("a\" -> a\), so backslash,
+# quote, backtick and bracket chars are all rejected. Verified in ash:
+# quoted-quote, single-quote, backslash, brace, angle and backtick patterns all
+# match; normal names with spaces / CJK / pipes / hyphens still pass.
+# NOTE: spaces must stay legal - real node names contain them.
+now_ok(){
+  [ -z "$1" ] && return 1
+  [ "${#1}" -gt 96 ] && return 1
+  case "$1" in *'"'*|*"'"*|*'\'*|*'{'*|*'}'*|*'<'*|*'>'*|*'`'*) return 1 ;; esac
+  return 0
+}
 put_node(){
   N="$1"; k=0
   while [ $k -lt 3 ]; do
@@ -84,7 +119,7 @@ put_node(){
 # google check (v8.1 proven flow): 1=clean (real google, 429 ok),
 #   2=polluted (google.cn landing or dead 000), 0=unknown landing
 BROWSER_UA="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-GOOGLE_URL="http://www.google.com/generate_204"   # M4: zero-download probe (was 213KB full page)
+GOOGLE_URL="https://www.google.com/generate_204"   # F6: https (was http); zero-download probe, -L kept
 google_check(){
   LOC=$(curl -s -o /dev/null -w "%{url_effective} %{http_code}" -m 6 -L -A "$BROWSER_UA" "$GOOGLE_URL")
   case "$LOC" in
@@ -97,28 +132,31 @@ google_check(){
 google_word(){ case "$1" in 2) echo polluted ;; 1) echo clean ;; *) echo unknown ;; esac; }
 # one throughput try, integer B/s
 speed_once(){ curl -s -o /dev/null -w "%{speed_download}" -m "$SPEED_MAX" "$SPEED_URL" 2>/dev/null | cut -d. -f1; }
-# median of SPEED_TRIES nonzero samples (0 if all empty)
+# F4 median: zeros counted in; a single lucky sample is NOT enough
+# (needs >=2 nonzero samples, else 0). Verified: [50000,0,0] -> 0.
 speed_med(){
   vals=""; k=1
   while [ $k -le "$SPEED_TRIES" ]; do
     S=$(speed_once); [ -z "$S" ] && S=0
     vals="$vals $S"; k=$((k+1))
   done
-  echo "$vals" | awk '{n=0;for(i=1;i<=NF;i++){if($i>0){v[++n]=$i}};if(n==0){print 0;exit}
-    for(i=2;i<=n;i++){t=v[i];j=i-1;while(j>0&&v[j]>t){v[j+1]=v[j];j--};v[j+1]=t}
-    print v[int((n+1)/2)]}'
+  echo "$vals" | awk '{m=0;nz=0;for(i=1;i<=NF;i++){v[++m]=$i+0;if($i+0>0)nz++}
+    if(nz<2){print 0;exit}
+    for(i=2;i<=m;i++){t=v[i];j=i-1;while(j>0&&v[j]>t){v[j+1]=v[j];j--};v[j+1]=t}
+    print v[int((m+1)/2)]}'
 }
 
 # ============================================================
 # SECTION 1: state (v9:FAIL:TS:RTS + LEDGER line)
 # ============================================================
-FAIL_N=0; LAST_TS=0; RACE_TS=0; LEDGER=""; RTS_LOG=""
+FAIL_N=0; LAST_TS=0; RACE_TS=0; LEDGER=""; RTS_LOG=""; PREV_BPS=0
 NOW=$(date +%s)
 SPIKE_FLAG=0
 if [ -f "$STATE" ]; then
-  SV=$(sed -n 1p "$STATE"); SL=$(sed -n 2p "$STATE"); R3=$(sed -n 3p "$STATE")
+  SV=$(sed -n 1p "$STATE"); SL=$(sed -n 2p "$STATE"); R3=$(sed -n 3p "$STATE"); R4=$(sed -n 4p "$STATE")
   case "$SL" in LEDGER=*) LEDGER=${SL#LEDGER=} ;; esac
   case "$R3" in RTS_LOG=*) RTS_LOG=${R3#RTS_LOG=} ;; esac
+  case "$R4" in PREV_BPS=*) PREV_BPS=${R4#PREV_BPS=} ;; esac
   case "$SV" in
     v9:*)
       BODY=${SV#v9:}
@@ -132,16 +170,18 @@ if [ -f "$STATE" ]; then
   esac
 fi
 case "$FAIL_N"  in ''|*[!0-9]*) FAIL_N=0 ;; esac
+case "$PREV_BPS" in ''|*[!0-9]*) PREV_BPS=0 ;; esac
 case "$LAST_TS" in ''|*[!0-9]*) LAST_TS=0 ;; esac
 case "$RACE_TS" in ''|*[!0-9]*) RACE_TS=0 ;; esac
 # stale mild count outside window is void
 [ "$LAST_TS" -gt 0 ] && [ $((NOW-LAST_TS)) -gt "$WIN_SEC" ] && FAIL_N=0
-save_state(){ printf '%s\n%s\n%s\n' "v9:$1:$2:$RACE_TS" "LEDGER=$LEDGER" "RTS_LOG=$RTS_LOG" > "$STATE"; }
+# F8: 4th line = PREV_BPS (old 3-line state -> missing -> fallback 0)
+save_state(){ printf '%s\n%s\n%s\n%s\n' "v9:$1:$2:$RACE_TS" "LEDGER=$LEDGER" "RTS_LOG=$RTS_LOG" "PREV_BPS=$PREV_BPS" > "$STATE"; }
 
 # ============================================================
 # SECTION 2: manual take-over switch, api alive, ledger
 # ============================================================
-if [ -f /root/.nodeguard.off ]; then
+if [ -f "$OFFFILE" ]; then
   # heartbeat once per hour (state TS older than 3000s) then exit
   if [ $((NOW-LAST_TS)) -gt 3000 ]; then
     log "OFF manual hold active (file present), skip round"
@@ -150,6 +190,16 @@ if [ -f /root/.nodeguard.off ]; then
   exit 0
 fi
 curl -s -m 5 -H "$AH" "$API/version" >/dev/null 2>&1 || { log "WARN mihomo api unreachable, skip"; exit 0; }
+# F10: runtime assert - SEL must be a Selector group. If someone changes
+# the group type to url-test/fallback, /group/{SEL}/delay would UNPIN it
+# (route_groups.go L62-65: only non-Selector groups get ForceSet("")),
+# which breaks the "no unpin side effect" invariant. Refuse + alert.
+SEL_TYPE=$(curl -s -m 5 -H "$AH" "$API/proxies/$(enc "$SEL")" | tr ',' '\n' | grep -o '"type":"[^"]*"' | head -n1 | sed 's/^"type":"//; s/"$//')
+case "$SEL_TYPE" in
+  Selector) : ;;
+  "")      log "WARN cannot read group type, skip round"; exit 0 ;;
+  *)       log "ERR group [$SEL] type is [$SEL_TYPE] not Selector; stage-1 delay would UNPIN it, REFUSE to run. Fix NG_GROUP_SEL or yaml."; exit 0 ;;
+esac
 CUR=$(get_now)
 now_ok "$CUR" || { log "WARN read selector failed (bad response [$CUR]), skip"; exit 0; }
 [ -n "$LEDGER" ] || LEDGER="$CUR"
@@ -167,15 +217,21 @@ BEST_BPS=$(speed_once); [ -z "$BEST_BPS" ] && BEST_BPS=0
 SUSPECT=0
 [ "$R204" != "204" ] && SUSPECT=1
 [ "$BEST_BPS" -lt "$THRESH_BPS" ] && SUSPECT=1
+# F7: re-test when suspected; gate uses the LOWER of the two (conservative,
+# same direction as race median). v9.1 used the HIGHER -> gate could see a
+# lucky peak the race would never reproduce. Traffic cost is identical.
 if [ $SUSPECT -eq 1 ]; then
-  B2=$(speed_once)
-  [ -n "$B2" ] && [ "$B2" -gt "$BEST_BPS" ] 2>/dev/null && BEST_BPS=$B2
+  B2=$(speed_once); [ -z "$B2" ] && B2=0
+  [ "$B2" -gt 0 ] && [ "$B2" -lt "$BEST_BPS" ] && BEST_BPS=$B2
 fi
 GW=$(google_word "$G")
 
-# A1 spike confirm: compare with last OK round bps from log
-PREV_BPS=$(grep -F "OK [$CUR]" "$LOG" 2>/dev/null | tail -1 | sed 's/.*bps=//;s/ .*//')
-case "$PREV_BPS" in ''|*[!0-9]*) PREV_BPS=0 ;; esac
+# A1 spike confirm: F8 - PREV_BPS from state line 4; log is only a fallback
+# (log trims to tail-100, which can silently kill the old grep-based path)
+if [ "$PREV_BPS" -eq 0 ]; then
+  PREV_BPS=$(grep -F "OK [$CUR]" "$LOG" 2>/dev/null | tail -1 | sed 's/.*bps=//;s/ .*//')
+  case "$PREV_BPS" in ''|*[!0-9]*) PREV_BPS=0 ;; esac
+fi
 if [ "$PREV_BPS" -gt 0 ] && [ "$BEST_BPS" -gt 0 ]; then
   DROP=$(( (PREV_BPS - BEST_BPS) * 100 / PREV_BPS ))
   if [ "$DROP" -gt "$SPIKE_PCT" ] && [ "$BEST_BPS" -lt "$THRESH_BPS" ]; then
@@ -183,6 +239,8 @@ if [ "$PREV_BPS" -gt 0 ] && [ "$BEST_BPS" -gt 0 ]; then
   fi
 fi
 if [ "$RACE_TS" -gt 0 ] && [ $((NOW-RACE_TS)) -lt "$RACE_CD" ]; then REM=$((RACE_CD-(NOW-RACE_TS))); else REM=0; fi
+# F8: persist this round's observed bps as PREV_BPS for next round
+[ "$BEST_BPS" -gt 0 ] 2>/dev/null && PREV_BPS=$BEST_BPS
 log "OK [$CUR] google=$GW 204=$R204 bps=$BEST_BPS fail=${FAIL_N}/${FAIL_TRIGGER} rcd=${REM}s spike=${SPIKE_FLAG}"
 
 # ============================================================
@@ -269,6 +327,7 @@ DELAY_JSON=$(curl -s -m 30 -H "$AH" "$API/group/$SELU/delay?url=https%3A%2F%2Fww
 # layer 2 (M5): keep only protocol-typed real nodes from providers API;
 #          groups / DIRECT / REJECT are excluded by type, not by name guessing
 TYPE_F=/tmp/ng9_types.$$
+GRP_F=/tmp/ng9_grps.$$
 TYPE_N=0
 # awk index-extraction; keep only real protocol-typed nodes (M5)
 curl -s -m 15 -H "$AH" "$API/providers/proxies" 2>/dev/null | tr '{' '\n' | awk -v t="$PROV_TYPES" '
@@ -286,6 +345,25 @@ TPS_ALL=$(echo "$DELAY_JSON" | sed 's/^[{]*//; s/[}]*$//; s/"//g' | tr ',' '\n' 
   | grep -v -e 'DIRECT' -e '自动选择' -e '其他地区' -e '建议' -e '订阅' \
             -e '官网' -e '剩余' -e '重置' -e '到期' -e '套餐' -e '：' \
             -e '倍率' -e '勿跑' -e '过期' -e '失联' )
+
+# F5: subtract the authoritative GROUP set parsed from /proxies.
+# Verified live: /proxies returns ONLY groups + builtins (32 entries),
+# never provider nodes, because provider nodes do not register in
+# tunnel.Proxies(). So this subtraction is exact and survives the
+# providers-API-down degraded path, where the keyword blacklist alone
+# would happily keep "🇭🇰 香港节点" and then put_node it (legal, but a
+# nested delegation instead of a real node).
+curl -s -m 10 -H "$AH" "$API/proxies" 2>/dev/null \
+  | tr '{' '\n' | grep -o '"name":"[^"]*"' | sed 's/^"name":"//; s/"$//' \
+  | sort -u > "$GRP_F"
+GRP_N=$(grep -c . "$GRP_F" 2>/dev/null)
+if [ "${GRP_N:-0}" -gt 0 ] 2>/dev/null; then
+  TPS_G=$(printf '%s\n' "$TPS_ALL" | awk -F'\t' 'NR==FNR{g[$0]=1;next} NF>1 && !($2 in g)' "$GRP_F" -)
+  TPS_ALL=$TPS_G
+else
+  log "WARN /proxies group set unreadable, group subtraction skipped (F5 degraded)"
+fi
+rm -f "$GRP_F"; GRP_F=""
 if [ -n "$TPS_ALL" ] && [ "$TYPE_N" -gt 0 ] 2>/dev/null; then
   TPS_TY=$(printf '%s\n' "$TPS_ALL" | awk -F'\t' 'NR==FNR{ok[$1]=1;next} ok[$2]' "$TYPE_F" -)
   if [ -n "$TPS_TY" ]; then
@@ -326,12 +404,20 @@ on_exit(){
   TERM_SIG=1
   rmdir "$LOCK_DIR" 2>/dev/null
   rm -f "$RACE_RES" "$SCORED" 2>/dev/null
-  [ -n "$TYPE_F" ] && rm -f "$TYPE_F"
+  [ -n "$GRP_F" ] && rm -f "$GRP_F"
   [ "$SW_DONE" = "1" ] && exit 0
   CN=$(get_now); now_ok "$CN" || exit 0
   [ "$CN" = "$CUR" ] && exit 0
-  put_node "$CUR" >/dev/null 2>&1
-  log "TRAP exit mid-race: group was [$CN], restored [$CUR]"
+  # F2: capture the result; only claim "restored" if it really happened.
+  # Old v9.1 threw the return value away and always logged "restored",
+  # so a failed recovery read as success (worst case: TERM landed on a
+  # candidate while it was being measured).
+  RB=$(put_node "$CUR")
+  if [ "$RB" = "$CUR" ]; then
+    log "TRAP exit mid-race: group was [$CN], restored [$CUR]"
+  else
+    log "ERR TRAP restore FAILED (wanted [$CUR], actual [$RB]) - group left on [$CN]!!! MANUAL CHECK REQUIRED"
+  fi
   exit 0
 }
 trap 'on_exit' EXIT INT TERM HUP
@@ -349,6 +435,7 @@ while [ $k -le "$TRY204" ]; do
   k=$((k+1))
 done
 CG=$(google_check)
+[ "$TERM_SIG" = "1" ] && exit 0       # F11: TERM checkpoint before the 12s measure
 CMED=$(speed_med)
 CUR_LAT=$(printf '%s\n' "$TPS_ALL" | awk -F'\t' -v n="$CUR" '$2==n{print $1; exit}')
 [ -z "$CUR_LAT" ] && CUR_LAT=999
@@ -385,6 +472,7 @@ for N in $RACE_LIST; do
     log "  cand [$N] google $(google_word $CG), skip"
     continue
   fi
+  [ "$TERM_SIG" = "1" ] && break        # F11: TERM checkpoint before the 12s measure
   MED=$(speed_med)
   LAT=$(printf '%s\n' "$TPS_ALL" | awk -F'\t' -v n="$N" '$2==n{print $1; exit}')
   [ -z "$LAT" ] && LAT=999

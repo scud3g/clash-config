@@ -27,7 +27,9 @@ log-level: info
 unified-delay: true
 tcp-concurrent: true
 external-controller: 0.0.0.0:9090
-find-process-mode: strict
+# find-process-mode: off -- router has no per-process need; official docs
+# recommend off on routers to cut per-connection lookups (was: strict)
+find-process-mode: off
 global-ua: chrome
 
 profile:
@@ -112,8 +114,10 @@ proxy-groups:
   - name: '♻️ 自动选择'
     type: url-test
     url: https://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 50
+    # interval removed: source-verified no-op (group url == provider hc url,
+    # registerHealthCheckTask drops it). Real timer = provider health-check.
+    # tolerance 50 -> 200: stop near-parity ping-pong between nodes
+    tolerance: 200
     use:
       - SMJC
     exclude-filter: '建议|订阅|官网|剩余|重置|到期|套餐'
@@ -121,8 +125,7 @@ proxy-groups:
   - name: '🔯 香港节点'
     type: url-test
     url: https://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 50
+    tolerance: 200
     use:
       - SMJC
     filter: '香港'
@@ -131,8 +134,7 @@ proxy-groups:
   - name: '🇯🇵 日本节点'
     type: url-test
     url: https://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 50
+    tolerance: 200
     use:
       - SMJC
     filter: '日本'
@@ -141,8 +143,7 @@ proxy-groups:
   - name: '🇸🇬 新加坡节点'
     type: url-test
     url: https://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 50
+    tolerance: 200
     use:
       - SMJC
     filter: '新加坡'
@@ -151,8 +152,7 @@ proxy-groups:
   - name: '🇺🇸 美国节点'
     type: url-test
     url: https://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 50
+    tolerance: 200
     use:
       - SMJC
     filter: '美国'
@@ -161,8 +161,7 @@ proxy-groups:
   - name: '🇹🇼 台湾节点'
     type: url-test
     url: https://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 50
+    tolerance: 200
     use:
       - SMJC
     filter: '台湾'
@@ -171,8 +170,7 @@ proxy-groups:
   - name: '🇰🇷 韩国节点'
     type: url-test
     url: https://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 50
+    tolerance: 200
     use:
       - SMJC
     filter: '韩国'
@@ -181,8 +179,7 @@ proxy-groups:
   - name: '🌐 其他地区'
     type: url-test
     url: https://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 50
+    tolerance: 200
     use:
       - SMJC
     filter: '英国|加拿大|卢森堡'
@@ -345,7 +342,9 @@ proxy-providers:
       enable: true
       lazy: true
       url: https://www.gstatic.com/generate_204
-      interval: 600
+      # 600 -> 900: the only real timer driving node health tests;
+      # calmer probing, node health data still fresh enough for guard use
+      interval: 900
     override:
       udp: true
 

@@ -1,34 +1,112 @@
 #!/bin/sh
 # ============================================================
-# nodeguard.sh v9.2 - merged debounce edition
-# Base: v9.1+ (486 lines / 64264e27, production since 2026-11-23)
-# v9.2 fixes (external review items, each re-verified live before applying):
-#  F1 now_ok hardening: exact JSON field parse (grep -o) instead of
-#     greedy sed; HTML / truncated / 502 pages now yield empty -> reject.
-#     Length cap + reject control chars and quote/brace. SPACES ARE
-#     ALLOWED: real provider nodes contain spaces, verified live
-#     ("韩国 cdn|电信高速|2倍率"). Never blacklist spaces.
-#  F2 on_exit captures put_node result; never log "restored" on fail.
-#  F3 lock stale 10min -> 4min (cron is 5min; avoid losing 2 rounds).
-#  F4 speed_med: zeros count into median; <2 nonzero samples -> 0
-#     (single lucky sample can no longer pass a slow node).
-#  F5 group-name subtraction from /proxies. Verified: /proxies holds
-#     ONLY groups+builtins (32 entries), zero provider nodes, because
-#     provider nodes never enter tunnel.Proxies(). Authoritative group
-#     set, works even when providers API is down.
-#  F6 GOOGLE_URL http -> https (both 204, verified live).
-#  F7 health gate uses LOWER of two samples (was HIGHER) - same
-#     conservative direction as race median; no extra traffic.
-#  F8 PREV_BPS persisted to state line 4 (spike no longer depends on
-#     log retention); missing 4th line -> PREV_BPS=0 (old state ok).
-#  F9 PROV_TYPES whitelist completed from constant_adapters.go.
-#  F10 NG_OFF sandboxable + runtime assert: SEL must be Selector
-#      (if group type changes, stage-1 group delay would unpin -> refuse).
-#  F11 in-loop TERM checkpoint before speed_med in candidate loop.
-# v9.2: F1-F11 (see header). Decision logic itself is unchanged.
-#        budget hard ceiling (B2), type-based candidate filter
-#        from providers API (M5)
-# v9.2: see F1-F11 above. All decisions logic unchanged.
+# nodeguard.sh v9.6 - state-accuracy and division-guard fixes
+# Base: v9.5 (658 non-blank lines / AFB8928F, 2026-11-24)
+# v9.6 fixes (F16-F21, found by a line-by-line read of v9.5):
+#  F16 (P4) Log trim ran BEFORE the instance lock and used a fixed temp
+#     name ($LOG.new). Two overlapping cron rounds could both tail+mv; the
+#     mv is atomic but the loser keeps writing into an already-unlinked
+#     inode, silently losing the lines it logs afterwards. Trim moved below
+#     the lock (single writer), temp name now carries $$.
+#  F17 (P3) Healthy round INSIDE the cooldown exited without save_state,
+#     so the PREV_BPS refreshed earlier that round (next round's spike
+#     baseline) and any stale FAIL_N were dropped. The healthy path outside
+#     cooldown already saved; this makes both consistent. A node that
+#     recovers during cooldown is the normal case, not an edge case.
+#  F18 (P3) A failed screen (no response / empty / pool <3) wrote
+#     FAIL_N=1, nudging the next mild anomaly over FAIL_TRIGGER and racing
+#     for something nothing had measured - the same half-accounting F13
+#     removed from the budget side. These paths now keep FAIL_N untouched;
+#     a screen fault is infrastructure, not node health.
+#  F20 (P3) When cur was missing from the group-delay pool, CUR_LAT fell
+#     back to a punitive 999ms. cur had already passed the 204 and google
+#     gates, so it IS a real node; only its delay sample was missing. At
+#     999ms sc_lat collapses to ~70/100 even when cur's true latency was
+#     the best, which can push a healthy cur past TIE_PCT and cause a
+#     needless switch. Now: cur's latency is estimated as the pool median
+#     (neutral); 999 only when the pool has no usable delay at all.
+#  F21 (P3) In the keep branch, [ "$CUR_SCORE" = "0" ] could never be true:
+#     the score column is printed with "%.1f", so it is always "0.0". With
+#     CUR_SCORE=0.0 the next awk did b*100/0 -> empty output -> a log line
+#     "margin % under TIE_PCT". The guard now lives inside awk (c+0<=0).
+#  F19 (P3, comment only) S4's pool floor checks POOL SIZE, not the number
+#     of live candidates; a >=3 pool can still seat nobody and only finds
+#     out at the SEATS<1 branch, after the slot is spent. Deliberately left
+#     unfixed: widening TOP_PICK costs probe time per extra candidate and
+#     there is no field data on how often SEATS<1 fires. Watch the log.
+# Behaviour note: F18 and F20 change what gets written to state and how one
+# scoring input is derived. Decision weights, gates and thresholds are
+# unchanged. Rejected in this pass: "stability score is fake" (N2 already
+# made it real, min/max of the 3 samples) and "budget window hardcoded"
+# (B2 already passes -v w=; no literal 3600 outside the conf default).
+# v9.5 retained (deferred budget commit + honest version log):
+#  F13 (P2) Race budget and cooldown were committed in SECTION 4, which
+#     runs BEFORE the stage-1 screen. An empty screen or a <3 node pool
+#     (S4 floor) then exited with RACE_TS already armed (full RACE_CD
+#     window) and one budget slot burned, for a race that never ran. Two
+#     such rounds inside the budget window blocked every real race for the
+#     rest of that hour, and mild anomalies were suppressed by a
+#     cooldown that nothing had earned. Commit moved to SECTION 5a, after
+#     the screen proves a real pool; DRY_RUN still exits before it.
+#  F14 (P2) The per-round log line still printed "RUN v9.3" inside v9.4,
+#     which defeats E1 (logging the build id is only useful if it names
+#     the build actually running). Now prints v9.6.
+#  F15 (P3) Log trim window 100 -> 400 lines (200KB byte cap kept). A round
+#     writes 5-15 lines, so tail -100 held only ~10-30 rounds and the A1
+#     PREV_BPS log fallback could miss the previous "OK [cur]" line.
+#  Reviewed and REJECTED in this pass (no change made):
+#   - B2 "budget window hardcoded": false. In v9.4 the awk call at L356
+#     already passed -v w="$RACE_BUDGET_WIN"; grep of the whole file shows
+#     no literal 3600 outside the conf default.
+#   - "TIE_PCT keeps an unseated cur": false. With CUR_SCORE=0 the awk
+#     test b*100 >= 0*(100+p) is true -> MARGIN=1 -> KEEP stays 0, so the
+#     script switches away correctly. Traced by hand, not assumed.
+#  Decision logic is unchanged: same weights, same gates, same scoring.
+# v9.4 retained (S-series lock/floor hardening):
+#  S3 stale-lock cleanup now runs even when mkdir fails. Old v9.3
+#     exited on mkdir failure, so a lock left by a crashed round made
+#     every later round "SKIP another instance" forever - the -mmin +8
+#     reclaim was never reached. Now mkdir-fail still checks stale and
+#     reclaims. (Real P2 found while reading v9.3.)
+#  S4 pool floor: a 1-2 node screen (<3) now bails without racing
+#     (was: WARN and continue). TOP_PICK=3 can never fill, and a race
+#     over a tiny pool usually re-validates the current node while
+#     burning budget. Keep current, log, exit.
+# v9.3 retained (N/E series from deep review + external research):
+#  N1 save_state atomic: write STATE.tmp then mv (2 lines). Old '>'
+#     truncates first; a killed round left a half/empty state which
+#     zeroed FAIL_N/PREV_BPS/RACE_TS and silently bypassed cooldown
+#     and hourly budget on the next round.
+#  N2 stability score is now REAL: min/max ratio of the 3 throughput
+#     samples (speed_med already collects them). [120000,60000,30000]
+#     -> 25, [100000,98000,99000] -> 98. Placeholder const 100 is
+#     gone. Set W_STAB=0 in conf to disable (score only records).
+#     NOTE: stability now needs SPEED_TRIES>=3 to be meaningful;
+#     with 2 samples the ratio is coarse (0 or ~near-100). Default 3.
+#  N3 F7 side effect documented: health gate stores the LOWER of two
+#     samples as PREV_BPS, so the spike detector sees a shrunken
+#     baseline. Conservative direction, accepted; just be aware when
+#     tuning SPIKE_PCT. (comment-only change)
+#  N4 screen_cnt warning threshold raised: group delay fires one
+#     goroutine per member with NO concurrency cap (mihomo
+#     adapter_outboundgroup_groupbase.go L237-263; provider
+#     healthcheck has SetLimit(10), group delay does not). 53 members
+#     = 53 concurrent probes. >80 gets a WARN line now.
+#  E1 mihomo version logged each round (1 line): /version response
+#     kept in the log, so a future API behavior change (see mihomo
+#     commit 85c1798f which moved provider nodes out of /proxies)
+#     can be attributed from the log instead of guessing.
+#  S1 lock stale 4min -> 8min: worst-case round path was measured
+#     ~265s (4.4min) > 4min stale threshold, so a slow-but-alive
+#     round could be stolen by the next cron tick (concurrency race).
+#     8min sacrifices at most 1 round on a really stuck lock instead.
+#  S2 EXT path stops polluting the baseline: on external change the
+#     old code fell through to the PREV_BPS persist line and overwrote it
+#     round's measurement, shrinking the spike detector baseline for
+#     a node nobody evaluated. Now: sync ledger, zero PREV_BPS
+#     (fresh baseline next round), save, exit.
+# All F1-F12 from v9.2 retained. Decision logic unchanged except
+# the real stability column (same weights: W_LAT=30 W_THR=60 W_STAB=10).
 # Stage1 screen: /group/{SEL}/delay (no unpin side effect,
 #        no per-switch jitter; per-node /proxies/{n}/delay is NOT
 #        usable here: provider nodes never register in tunnel
@@ -79,15 +157,36 @@ LOG="${NG_LOG:-/root/nodeguard.log}"
 LOCK_DIR="${NG_LOCK:-/tmp/nodeguard_v9.lock}"   # F12: sandboxable lock (default unchanged)
 OFFFILE="${NG_OFF:-/root/.nodeguard.off}"   # F10: sandboxable
 log(){ echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG"; }
-# log trim (v8.1 rule: 200KB cap, keep last 100 lines)
-[ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 204800 ] && tail -100 "$LOG" > "$LOG.new" && mv "$LOG.new" "$LOG"
+# log trim (v8.1 rule: 200KB cap). F15: keep last 400 lines instead of
+# 100 - a round writes 5-15 lines, so 100 lines only covered ~10-30 rounds
+# and the A1 PREV_BPS fallback (grep the previous "OK [cur]" line) could
+# miss. 400 lines is ~40KB, still far under the 200KB cap.
+# F16 (v9.6): the trim moved BELOW the lock (was above it) and the temp
+# name carries $$. Above the lock two overlapping cron rounds could both
+# run tail+mv; the mv is atomic but the loser then keeps writing into an
+# already-unlinked inode, silently losing its own log lines. Inside the
+# critical section there is only one writer, and $$ avoids a name clash.
 
-# ---- single instance lock (mkdir + stale guard > 4min) ----
-# F3: cron period is 5min; a 10min stale window loses 2 rounds.
-mkdir "$LOCK_DIR" 2> /dev/null || { log "SKIP another instance running"; exit 0; }
-OLD=$(find "$LOCK_DIR" -mmin +4 2>/dev/null)
-if [ -n "$OLD" ]; then rm -rf "$LOCK_DIR"; mkdir "$LOCK_DIR" 2>/dev/null || exit 0; fi
+# ---- single instance lock (mkdir + stale guard > 8min) ----
+# S1: worst-case round path ~265s (4.4min) > old 4min threshold, so a
+# slow-but-alive round could be stolen by the next cron tick. 8min it is.
+# S3: stale cleanup must run EVEN when mkdir fails. Old code exited on
+# mkdir failure (old v9.3 exited here), so a stale lock (left by a crashed round) made
+# every later round "SKIP another instance" forever, and the -mmin +8
+# cleanup below was NEVER reached. Now: mkdir fails -> still check stale
+# -> reclaim if old enough -> only then give up.
+if ! mkdir "$LOCK_DIR" 2> /dev/null; then
+  if [ -n "$(find "$LOCK_DIR" -mmin +8 2>/dev/null)" ]; then
+    rm -rf "$LOCK_DIR" 2>/dev/null
+    mkdir "$LOCK_DIR" 2>/dev/null || { log "SKIP lock contention after stale reclaim"; exit 0; }
+  else
+    log "SKIP another instance running"
+    exit 0
+  fi
+fi
 trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT INT TERM HUP
+# F16: log trim runs inside the critical section (see note above).
+[ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 204800 ] && tail -400 "$LOG" > "$LOG.$$.new" && mv "$LOG.$$.new" "$LOG"
 
 # ---- helpers ----
 enc(){ printf "%s" "$1" | awk 'BEGIN{for(i=0;i<256;i++)o[sprintf("%c",i)]=i}{n=length($0);for(i=1;i<=n;i++){c=substr($0,i,1);if(c~/[A-Za-z0-9._~-]/)printf"%s",c;else printf"%%%02X",o[c]}}'; }
@@ -134,6 +233,10 @@ google_word(){ case "$1" in 2) echo polluted ;; 1) echo clean ;; *) echo unknown
 speed_once(){ curl -s -o /dev/null -w "%{speed_download}" -m "$SPEED_MAX" "$SPEED_URL" 2>/dev/null | cut -d. -f1; }
 # F4 median: zeros counted in; a single lucky sample is NOT enough
 # (needs >=2 nonzero samples, else 0). Verified: [50000,0,0] -> 0.
+# N2: also outputs a stability score = min/max of the samples * 100,
+# as a SECOND field (tab separated). [100000,98000,99000] -> 98;
+# [120000,60000,30000] -> 25; <2 nonzero samples -> 0.
+# With SPEED_TRIES=2 the ratio is coarse; default 3 recommended.
 speed_med(){
   vals=""; k=1
   while [ $k -le "$SPEED_TRIES" ]; do
@@ -141,9 +244,9 @@ speed_med(){
     vals="$vals $S"; k=$((k+1))
   done
   echo "$vals" | awk '{m=0;nz=0;for(i=1;i<=NF;i++){v[++m]=$i+0;if($i+0>0)nz++}
-    if(nz<2){print 0;exit}
+    if(nz<2){print 0"\t"0;exit}
     for(i=2;i<=m;i++){t=v[i];j=i-1;while(j>0&&v[j]>t){v[j+1]=v[j];j--};v[j+1]=t}
-    print v[int((m+1)/2)]}'
+    print v[int((m+1)/2)] "\t" int(v[1]*100/v[m])}'
 }
 
 # ============================================================
@@ -176,7 +279,9 @@ case "$RACE_TS" in ''|*[!0-9]*) RACE_TS=0 ;; esac
 # stale mild count outside window is void
 [ "$LAST_TS" -gt 0 ] && [ $((NOW-LAST_TS)) -gt "$WIN_SEC" ] && FAIL_N=0
 # F8: 4th line = PREV_BPS (old 3-line state -> missing -> fallback 0)
-save_state(){ printf '%s\n%s\n%s\n%s\n' "v9:$1:$2:$RACE_TS" "LEDGER=$LEDGER" "RTS_LOG=$RTS_LOG" "PREV_BPS=$PREV_BPS" > "$STATE"; }
+# N1: atomic write - a killed round must not leave a truncated state
+# (half-written line 1 zeroes FAIL_N and resets cooldown/budget).
+save_state(){ printf '%s\n%s\n%s\n%s\n' "v9:$1:$2:$RACE_TS" "LEDGER=$LEDGER" "RTS_LOG=$RTS_LOG" "PREV_BPS=$PREV_BPS" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"; }
 
 # ============================================================
 # SECTION 2: manual take-over switch, api alive, ledger
@@ -189,7 +294,15 @@ if [ -f "$OFFFILE" ]; then
   fi
   exit 0
 fi
-curl -s -m 5 -H "$AH" "$API/version" >/dev/null 2>&1 || { log "WARN mihomo api unreachable, skip"; exit 0; }
+# E1: keep the mihomo version in the log (once per round, cheap) - if a
+# future mihomo commit changes /proxies structure (85c1798f precedent:
+# provider nodes were moved out of /proxies), the log answers "why did
+# F5/F10 suddenly behave differently" without guesswork.
+VER_RESP=$(curl -s -m 5 -H "$AH" "$API/version" 2>/dev/null)
+[ -z "$VER_RESP" ] && { log "WARN mihomo api unreachable, skip"; exit 0; }
+NG_VER=$(printf '%s' "$VER_RESP" | tr ',' '\n' | grep -o '"version":"[^"]*"' | head -n1 | cut -d'"' -f4)
+case "$NG_VER" in ""|*[!-.A-Za-z0-9+]*) NG_VER=unreadable ;; esac
+log "RUN v9.6 mihomo=$NG_VER"
 # F10: runtime assert - SEL must be a Selector group. If someone changes
 # the group type to url-test/fallback, /group/{SEL}/delay would UNPIN it
 # (route_groups.go L62-65: only non-Selector groups get ForceSet("")),
@@ -204,8 +317,13 @@ CUR=$(get_now)
 now_ok "$CUR" || { log "WARN read selector failed (bad response [$CUR]), skip"; exit 0; }
 [ -n "$LEDGER" ] || LEDGER="$CUR"
 if [ "$LEDGER" != "$CUR" ]; then
-  log "EXT external change [$LEDGER] -> [$CUR] (manual/panel/restart), ledger synced, no action"
-  LEDGER="$CUR"
+  # S2: do NOT fall through to the PREV_BPS persist line - that
+  # polluted the spike baseline with a measurement of a node nobody
+  # evaluated. Sync ledger, zero the baseline, let next round re-seed.
+  log "EXT external change [$LEDGER] -> [$CUR] (manual/panel/restart), ledger synced, baseline reset, no action"
+  LEDGER="$CUR"; PREV_BPS=0
+  save_state "$FAIL_N" "$NOW"
+  exit 0
 fi
 
 # ============================================================
@@ -220,6 +338,9 @@ SUSPECT=0
 # F7: re-test when suspected; gate uses the LOWER of the two (conservative,
 # same direction as race median). v9.1 used the HIGHER -> gate could see a
 # lucky peak the race would never reproduce. Traffic cost is identical.
+# N3 side effect (documented, accepted): the lower sample is what gets
+# persisted as PREV_BPS, so the spike detector baseline shrinks a bit -
+# when tuning SPIKE_PCT remember DROP is measured against the lower bar.
 if [ $SUSPECT -eq 1 ]; then
   B2=$(speed_once); [ -z "$B2" ] && B2=0
   [ "$B2" -gt 0 ] && [ "$B2" -lt "$BEST_BPS" ] && BEST_BPS=$B2
@@ -227,7 +348,7 @@ fi
 GW=$(google_word "$G")
 
 # A1 spike confirm: F8 - PREV_BPS from state line 4; log is only a fallback
-# (log trims to tail-100, which can silently kill the old grep-based path)
+# (log trims to tail-400, which can still silently kill the old grep-based path)
 if [ "$PREV_BPS" -eq 0 ]; then
   PREV_BPS=$(grep -F "OK [$CUR]" "$LOG" 2>/dev/null | tail -1 | sed 's/.*bps=//;s/ .*//')
   case "$PREV_BPS" in ''|*[!0-9]*) PREV_BPS=0 ;; esac
@@ -271,7 +392,13 @@ if [ "$RACE_TS" -gt 0 ] && [ $((NOW-RACE_TS)) -lt "$RACE_CD" ]; then
       FAIL_N=$((FAIL_N+1)); LAST_TS=$NOW; save_state "$FAIL_N" "$NOW"; exit 0
     fi
   else
-    exit 0
+    # F17 (v9.6): healthy round inside cooldown. Old code exited without
+    # saving, so the PREV_BPS refreshed by the F8 persist line (spike
+    # baseline for the next round) and any stale FAIL_N were both dropped.
+    # The healthy path outside cooldown (bottom of SECTION 4) already does
+    # save_state 0; this makes both consistent. A recovered node inside
+    # cooldown is the NORMAL case, not an edge case.
+    save_state 0 "$NOW"; exit 0
   fi
 else
   if [ $BAD -eq 1 ]; then
@@ -300,26 +427,16 @@ else
   fi
 fi
 # reaching here: race passed window/cooldown gates.
-# B2 budget gate: hard ceiling per rolling hour, severe does NOT break it.
-RTS_LOG=$(printf '%s' "$RTS_LOG" | tr ',' '\n' | awk -v now="$NOW" -v w="$RACE_BUDGET_WIN" '$1+0>0 && now-$1<w' | tr '\n' ',' | sed 's/,$//')
-N_RECENT=$(printf '%s' "$RTS_LOG" | awk -F, 'NF>0{n=NF} END{print n+0}')
-if [ "$N_RECENT" -ge "$RACE_BUDGET_H" ]; then
-  log "WARN [$CUR] race budget exhausted (${N_RECENT}/${RACE_BUDGET_H} in ${RACE_BUDGET_WIN}s), keep cur"
-  save_state "$FAIL_N" "$NOW"
-  exit 0
-fi
-RTS_LOG="$RTS_LOG,$NOW"
-[ -z "${RTS_LOG%,*}" ] && RTS_LOG="$NOW"
-RACE_TS=$NOW
-save_state "$FAIL_N" "$NOW"
-log "RACE start reason=$REASON cur=[$CUR] budget=$((N_RECENT+1))/${RACE_BUDGET_H}"
+# F13: budget + cooldown are NOT committed here. They are committed in
+# SECTION 5a, after the stage-1 screen has proved a real pool exists, so
+# a failed or too-small screen no longer arms RACE_CD or burns a slot.
 
 # ============================================================
 # SECTION 5: stage-1 screen via group delay (no unpin, no switch)
 # ============================================================
 SELU=$(enc "$SEL")
 DELAY_JSON=$(curl -s -m 30 -H "$AH" "$API/group/$SELU/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=3000" 2>/dev/null)
-[ -z "$DELAY_JSON" ] && { log "ERR screen no response, keep [$CUR]"; save_state 1 "$NOW"; exit 0; }
+[ -z "$DELAY_JSON" ] && { log "ERR screen no response, keep [$CUR]"; save_state "$FAIL_N" "$NOW"; exit 0; }
 
 # parse layer 0: last-colon split (v8 rules)
 # layer 1: keyword junk filter (v8 rules, kept as defense in depth:
@@ -376,25 +493,73 @@ elif [ "$TYPE_N" -le 0 ]; then
 fi
 rm -f "$TYPE_F"; TYPE_F=""
 screen_cnt=$(printf '%s\n' "$TPS_ALL" | grep -c .)
+# F18 (v9.6): screen failure no longer writes FAIL_N=1.
+# A screen that returned nothing means the API/group probe wobbled, i.e. an
+# INFRASTRUCTURE fault, not evidence that the current node degraded. Writing
+# FAIL_N=1 nudged the next mild anomaly over FAIL_TRIGGER and raced for a
+# reason nothing had measured - the same half-accounting F13 removed from the
+# budget/cooldown side. Keep the counter untouched and just log.
 if [ -z "$TPS_ALL" ] || [ "$screen_cnt" -lt 1 ]; then
-  log "ERR screen produced nothing, keep [$CUR]"; save_state 1 "$NOW"; exit 0
+  log "ERR screen produced nothing, keep [$CUR]"; save_state "$FAIL_N" "$NOW"; exit 0
 fi
+# S4: pool floor - a 1-2 node screen is too small to race meaningfully
+# (TOP_PICK=3 can never fill, and a race over a tiny pool has a high
+# chance of just re-validating the current node while burning budget).
+# Keep current, log clearly, don't race. Only <1 (empty) was guarded
+# before; now <3 bails too.
+# NOTE (F19, v9.6): this floor checks POOL SIZE, not LIVE-CANDIDATE count.
+# The pool is built from group-delay replies, and stage-2 still re-gates
+# every candidate on 204 + google. So a >=3 pool can still yield zero seats
+# (all TOPS dead), and that path is only caught later at the SEATS<1 branch -
+# after the budget slot is already spent. Left as-is on purpose: widening
+# TOP_PICK costs ~8s of probing per extra candidate, and there is no field
+# data yet on how often SEATS<1 actually fires. Watch the log for "ERR race
+# all failed" frequency and revisit with real numbers.
 if [ "$screen_cnt" -lt 3 ]; then
-  log "WARN screen pool unusually small ($screen_cnt nodes), possible sub change"
+  log "WARN screen pool too small to race ($screen_cnt nodes < 3), keep [$CUR]"
+  save_state "$FAIL_N" "$NOW"
+  exit 0
+fi
+# N4: group delay fires one goroutine per member, NO concurrency cap
+# (mihomo groupbase.go URLTest L237-263; provider healthcheck has
+# SetLimit(10), group delay does not). Big pools = big probe bursts.
+if [ "${screen_cnt:-0}" -gt 80 ] 2>/dev/null; then
+  log "WARN screen pool very large ($screen_cnt nodes) - group delay probes all concurrently, consider narrowing the group"
 fi
 TOPS=$(printf '%s\n' "$TPS_ALL" | sort -n | head -"$TOP_PICK" | cut -f2-)
 log "  screen TOP${TOP_PICK}: $(printf '%s' "$TOPS" | tr '\n' ' ') (from $screen_cnt, typed=$TYPE_N)"
 
 # ---- shadow exit: measurement-without-switch would be fake ----
+# NOTE (F13): DRY_RUN exits here, i.e. BEFORE the budget commit, so a
+# shadow round never consumes a budget slot or arms the cooldown.
 if [ "$DRY_RUN" = "1" ]; then
   log "DRY shadow: real run would switch-measure [$(printf '%s' "$TOPS" | tr '\n' ' ')] + cur, no action taken"
   save_state 0 "$NOW"; exit 0
 fi
 
 # ============================================================
+# SECTION 5a: race budget + cooldown commit (F13: after screen)
+# ============================================================
+# Budget is a hard ceiling per rolling window; severe does NOT break it.
+# Committing here (not in SECTION 4) means only a race that will really
+# run costs a slot or starts the cooldown clock.
+RTS_LOG=$(printf '%s' "$RTS_LOG" | tr ',' '\n' | awk -v now="$NOW" -v w="$RACE_BUDGET_WIN" '$1+0>0 && now-$1<w' | tr '\n' ',' | sed 's/,$//')
+N_RECENT=$(printf '%s' "$RTS_LOG" | awk -F, 'NF>0{n=NF} END{print n+0}')
+if [ "$N_RECENT" -ge "$RACE_BUDGET_H" ]; then
+  log "WARN [$CUR] race budget exhausted (${N_RECENT}/${RACE_BUDGET_H} in ${RACE_BUDGET_WIN}s), keep cur"
+  save_state "$FAIL_N" "$NOW"
+  exit 0
+fi
+RTS_LOG="$RTS_LOG,$NOW"
+[ -z "${RTS_LOG%,*}" ] && RTS_LOG="$NOW"
+RACE_TS=$NOW
+save_state "$FAIL_N" "$NOW"
+log "RACE start reason=$REASON cur=[$CUR] budget=$((N_RECENT+1))/${RACE_BUDGET_H}"
+
+# ============================================================
 # SECTION 6: stage-2 race, cur-first, per-switch confirm
 # ============================================================
-RACE_RES=/tmp/ng9_race.$$        # format: name TAB lat TAB medbps
+RACE_RES=/tmp/ng9_race.$$        # format: name TAB lat TAB medbps TAB stab
 SCORED=/tmp/ng9_score.$$
 SW_DONE=0
 TERM_SIG=0
@@ -436,12 +601,29 @@ while [ $k -le "$TRY204" ]; do
 done
 CG=$(google_check)
 [ "$TERM_SIG" = "1" ] && exit 0       # F11: TERM checkpoint before the 12s measure
-CMED=$(speed_med)
+CMED_STAB=$(speed_med)
+CMED=$(printf '%s\n' "$CMED_STAB" | cut -f1)
+CSTAB=$(printf '%s\n' "$CMED_STAB" | cut -f2)
 CUR_LAT=$(printf '%s\n' "$TPS_ALL" | awk -F'\t' -v n="$CUR" '$2==n{print $1; exit}')
-[ -z "$CUR_LAT" ] && CUR_LAT=999
+# F20 (v9.6): cur missing from the pool must NOT cost it the latency vote.
+# cur already cleared the 204 and google gates this round, so it is a REAL
+# node; the only thing missing is its delay sample. The pool can miss it when
+# cur is not a member of SEL (cross-group pick) or when that one group-delay
+# probe timed out (groupbase.go URLTest only maps err==nil). Old code fell
+# back to a punitive 999ms, and with sc_lat = bestlat/(lat+1)*100 that drops
+# cur to ~70/100 even when its true latency was the best, which can push a
+# healthy cur past TIE_PCT and cause a needless switch.
+# New behaviour: estimate cur's latency as the pool's median delay (neutral,
+# neither rewarded nor punished). 999 only if the pool has no usable delay.
+if [ -z "$CUR_LAT" ]; then
+  CUR_LAT=$(printf '%s\n' "$TPS_ALL" | awk -F'\t' 'NF>1 && $1 ~ /^[0-9]+$/{print $1}' \
+    | sort -n | awk '{a[NR]=$1} END{ if(NR>0) print a[int((NR+1)/2)]; else print 999 }')
+  [ -z "$CUR_LAT" ] && CUR_LAT=999
+  log "  cur [$CUR] not in delay pool, lat estimated at pool median ${CUR_LAT}ms (F20)"
+fi
 if [ "$C_OK204" -eq "$TRY204" ] && [ "$CG" != "2" ]; then
-  printf '%s\t%s\t%s\n' "$CUR" "$CUR_LAT" "$CMED" >> "$RACE_RES"
-  log "  cur [$CUR] ok204=${C_OK204}/${TRY204} google=$(google_word $CG) thr=${CMED}B/s lat=${CUR_LAT}ms"
+  printf '%s\t%s\t%s\t%s\n' "$CUR" "$CUR_LAT" "$CMED" "$CSTAB" >> "$RACE_RES"
+  log "  cur [$CUR] ok204=${C_OK204}/${TRY204} google=$(google_word $CG) thr=${CMED}B/s stab=${CSTAB} lat=${CUR_LAT}ms"
 else
   log "  cur [$CUR] failed gates (204=${C_OK204}/${TRY204} google=$(google_word $CG)), no seat"
 fi
@@ -473,11 +655,13 @@ for N in $RACE_LIST; do
     continue
   fi
   [ "$TERM_SIG" = "1" ] && break        # F11: TERM checkpoint before the 12s measure
-  MED=$(speed_med)
+  MED_STAB=$(speed_med)
+  MED=$(printf '%s\n' "$MED_STAB" | cut -f1)
+  STB=$(printf '%s\n' "$MED_STAB" | cut -f2)
   LAT=$(printf '%s\n' "$TPS_ALL" | awk -F'\t' -v n="$N" '$2==n{print $1; exit}')
   [ -z "$LAT" ] && LAT=999
-  printf '%s\t%s\t%s\n' "$N" "$LAT" "$MED" >> "$RACE_RES"
-  log "  cand [$N] ok204=${OK204}/${TRY204} google=$(google_word $CG) thr=${MED}B/s lat=${LAT}ms"
+  printf '%s\t%s\t%s\t%s\n' "$N" "$LAT" "$MED" "$STB" >> "$RACE_RES"
+  log "  cand [$N] ok204=${OK204}/${TRY204} google=$(google_word $CG) thr=${MED}B/s stab=${STB} lat=${LAT}ms"
 done
 IFS=$SAVED_IFS
 
@@ -495,11 +679,14 @@ if [ -z "$SEATS" ] || [ "$SEATS" -lt 1 ]; then
   exit 0
 fi
 
-# columns: name TAB lat TAB med; stability is a placeholder (const 100)
+# columns: name TAB lat TAB med TAB stab. N2: stability is real now
+# (min/max ratio of the 3 throughput samples, 0-100). W_STAB=0 in
+# conf disables its vote (ratio still recorded in the log table).
 awk -F'\t' -v wl="$W_LAT" -v wt="$W_THR" -v ws="$W_STAB" '
   NR==FNR {
     if (FNR==1 || $2+0 < bestlat+0) bestlat=$2+0
     if (FNR==1 || $3+0 > bestthr+0) bestthr=$3+0
+    if (FNR==1 || $4+0 > beststab+0) beststab=$4+0
     next
   }
   {
@@ -510,16 +697,20 @@ awk -F'\t' -v wl="$W_LAT" -v wt="$W_THR" -v ws="$W_STAB" '
     thr = $3+0
     sc_thr = (bestthr <= 0) ? 0 : thr * 100 / bestthr
     if (sc_thr > 100) sc_thr = 100
-    sc_stab = 100
+    # N2: real stability = own ratio vs best ratio (never above 100);
+    # with ws=0 the stab vote vanishes and scores match v9.2 exactly
+    stab = $4+0
+    sc_stab = (beststab <= 0) ? 0 : stab * 100 / beststab
+    if (sc_stab > 100) sc_stab = 100
     score = (wl*sc_lat + wt*sc_thr + ws*sc_stab) / (wl + wt + ws)
-    printf "%.1f\t%s\t%s\t%s\n", score, $1, $2, $3
+    printf "%.1f\t%s\t%s\t%s\t%s\n", score, $1, $2, $3, stab
   }
 ' "$RACE_RES" "$RACE_RES" | sort -rn > "$SCORED"
 
-log "SCORE (score/name/lat/thr):"
+log "SCORE (score/name/lat/thr/stab):"
 TABC=$(printf '\t')
-while IFS="$TABC" read -r sc nm lt tb; do
-  log "  $nm score=$sc lat=${lt}ms thr=${tb}B/s"
+while IFS="$TABC" read -r sc nm lt tb st; do
+  log "  $nm score=$sc lat=${lt}ms thr=${tb}B/s stab=${st}"
 done < "$SCORED"
 
 BEST_LINE=$(head -1 "$SCORED")
@@ -541,8 +732,13 @@ if [ "$KEEP" = "1" ]; then
   if [ "$BEST_NODE" = "$CUR" ]; then
     log "OK race winner still [$CUR] ($BEST_SCORE), kept"
   else
-    [ "$CUR_SCORE" = "0" ] && CUR_SCORE=0.1
-    MARGIN_PCT=$(awk -v b="$BEST_SCORE" -v c="$CUR_SCORE" 'BEGIN{printf "%.0f", b*100/c-100}')
+    # F21 (v9.6): guard the division inside awk. The old shell test
+    # [ "$CUR_SCORE" = "0" ] could never fire, because the score column is
+    # printed with "%.1f" and is therefore always "0.0", never the literal
+    # "0". With CUR_SCORE=0.0 the next awk divided b*100/0 -> empty output ->
+    # a log line reading "margin % under TIE_PCT". Guarding on c+0<=0 fixes
+    # it regardless of how the string happens to be formatted.
+    MARGIN_PCT=$(awk -v b="$BEST_SCORE" -v c="$CUR_SCORE" 'BEGIN{ if(c+0<=0) c=0.1; printf "%.0f", b*100/c-100 }')
     log "OK margin ${MARGIN_PCT}% under TIE_PCT=${TIE_PCT}, keep [$CUR]"
   fi
   if [ "$CONFIRMED" = "$CUR" ]; then

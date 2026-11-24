@@ -1,7 +1,19 @@
 #!/bin/sh
 # ============================================================
-# nodeguard.sh v9.6 - state-accuracy and division-guard fixes
-# Base: v9.5 (658 non-blank lines / AFB8928F, 2026-11-24)
+# nodeguard.sh v9.7 - pre-race liveness precheck (F22)
+# Base: v9.6 (F1-F21 all retained; 660 non-blank lines / 4DB507F0, 2026-11-24)
+# v9.7 fix (F22):
+#  F22 (P3) A >=3 delay pool still checked one thing only: SIZE. The
+#     old path committed the budget slot and armed the cooldown BEFORE
+#     anyone had proved a single TOPS member was reachable. 3 dead nodes
+#     -> all gates fail -> SEATS<1 -> slot burned for a race that never
+#     measured anything real; worst case inside an hour this is the F13
+#     hole again. Now SECTION 5a pre-probes each TOPS member once with a
+#     single 204 (-m CAND_204_TMO, ~6s for TOP_PICK=3) BEFORE the budget
+#     commit; if EVERY probe fails it is an infrastructure-grade fault -
+#     same semantics as F13/F18 screen faults: no FAIL_N write, no slot,
+#     no cooldown, just log and exit. cur is NOT pre-probed here - it
+#     only enters if all TOPS are dead, and is measured in stage 2 anyway.
 # v9.6 fixes (F16-F21, found by a line-by-line read of v9.5):
 #  F16 (P4) Log trim ran BEFORE the instance lock and used a fixed temp
 #     name ($LOG.new). Two overlapping cron rounds could both tail+mv; the
@@ -29,11 +41,13 @@
 #     the score column is printed with "%.1f", so it is always "0.0". With
 #     CUR_SCORE=0.0 the next awk did b*100/0 -> empty output -> a log line
 #     "margin % under TIE_PCT". The guard now lives inside awk (c+0<=0).
-#  F19 (P3, comment only) S4's pool floor checks POOL SIZE, not the number
-#     of live candidates; a >=3 pool can still seat nobody and only finds
-#     out at the SEATS<1 branch, after the slot is spent. Deliberately left
-#     unfixed: widening TOP_PICK costs probe time per extra candidate and
-#     there is no field data on how often SEATS<1 fires. Watch the log.
+#  F19 (P3, v9.7: FIXED by F22) S4's pool floor checks POOL SIZE, not the
+#     number of live candidates; a >=3 pool could still seat nobody and only
+#     found out at the SEATS<1 branch, after the slot was spent. F22 (v9.7)
+#     adds a one-204 precheck per TOPS member BEFORE the budget commit, so
+#     the all-dead path no longer burns slot/cooldown. SEATS<1 can still
+#     fire mid-race (node dies between precheck and its gates) - that is
+#     genuinely measured traffic, the slot was earned by a live precheck.
 # Behaviour note: F18 and F20 change what gets written to state and how one
 # scoring input is derived. Decision weights, gates and thresholds are
 # unchanged. Rejected in this pass: "stability score is fake" (N2 already
@@ -302,7 +316,7 @@ VER_RESP=$(curl -s -m 5 -H "$AH" "$API/version" 2>/dev/null)
 [ -z "$VER_RESP" ] && { log "WARN mihomo api unreachable, skip"; exit 0; }
 NG_VER=$(printf '%s' "$VER_RESP" | tr ',' '\n' | grep -o '"version":"[^"]*"' | head -n1 | cut -d'"' -f4)
 case "$NG_VER" in ""|*[!-.A-Za-z0-9+]*) NG_VER=unreadable ;; esac
-log "RUN v9.6 mihomo=$NG_VER"
+log "RUN v9.7 mihomo=$NG_VER"
 # F10: runtime assert - SEL must be a Selector group. If someone changes
 # the group type to url-test/fallback, /group/{SEL}/delay would UNPIN it
 # (route_groups.go L62-65: only non-Selector groups get ForceSet("")),
@@ -507,14 +521,15 @@ fi
 # chance of just re-validating the current node while burning budget).
 # Keep current, log clearly, don't race. Only <1 (empty) was guarded
 # before; now <3 bails too.
-# NOTE (F19, v9.6): this floor checks POOL SIZE, not LIVE-CANDIDATE count.
-# The pool is built from group-delay replies, and stage-2 still re-gates
-# every candidate on 204 + google. So a >=3 pool can still yield zero seats
-# (all TOPS dead), and that path is only caught later at the SEATS<1 branch -
-# after the budget slot is already spent. Left as-is on purpose: widening
-# TOP_PICK costs ~8s of probing per extra candidate, and there is no field
-# data yet on how often SEATS<1 actually fires. Watch the log for "ERR race
-# all failed" frequency and revisit with real numbers.
+# NOTE (F19, v9.7: fixed by the F22 precheck below in SECTION 5a): this
+# floor checks POOL SIZE, not LIVE-CANDIDATE count. The pool is built from
+# group-delay replies, and stage-2 still re-gates every candidate on 204 +
+# google. A >=3 pool can still yield zero seats (all TOPS dead); before v9.7
+# that path was only caught at the SEATS<1 branch - after the budget slot was
+# already spent. The F22 precheck now re-probes each TOPS member once BEFORE
+# the budget commit, so the all-dead case exits without burning a slot;
+# SEATS<1 mid-race (node dying after its precheck passed) still spends the
+# slot, but then real measurement traffic was generated - the slot was earned.
 if [ "$screen_cnt" -lt 3 ]; then
   log "WARN screen pool too small to race ($screen_cnt nodes < 3), keep [$CUR]"
   save_state "$FAIL_N" "$NOW"
@@ -543,6 +558,33 @@ fi
 # Budget is a hard ceiling per rolling window; severe does NOT break it.
 # Committing here (not in SECTION 4) means only a race that will really
 # run costs a slot or starts the cooldown clock.
+# ---- F22 (v9.7): pre-race liveness precheck ----
+# One 204 probe per TOPS member BEFORE the budget commit. If EVERY probe
+# fails the race has nothing to measure - infrastructure-grade fault, same
+# semantics as F13/F18 screen faults: no FAIL_N write, no budget slot, no
+# cooldown; distinct log tag ("ERR precheck") so its rate can be counted.
+# Cost when healthy: TOP_PICK x CAND_204_TMO = 3 x 2s = 6s extra worst
+# case, still inside the S1 265s + margin. cur is NOT pre-probed: it only
+# matters when all TOPS are dead, and stage 2 measures it under the old
+# gates anyway.
+PC_OK=0
+PC_TOT=0
+for N in $(printf '%s' "$TOPS" | tr '\n' ' '); do
+  [ -z "$N" ] && continue
+  PC_TOT=$((PC_TOT+1))
+  C1=$(curl -s -o /dev/null -w "%{http_code}" -m "$CAND_204_TMO" "https://www.gstatic.com/generate_204" 2>/dev/null)
+  [ "$C1" = "204" ] && PC_OK=$((PC_OK+1))
+done
+if [ "${PC_TOT:-0}" -lt 1 ] 2>/dev/null; then
+  log "ERR precheck no TOPS member to probe, keep [$CUR]"
+  save_state "$FAIL_N" "$NOW"
+  exit 0
+fi
+if [ "$PC_OK" -lt 1 ]; then
+  log "ERR precheck all TOPS dead (0/$PC_TOT), keep [$CUR] - infra fault, no slot spent"
+  save_state "$FAIL_N" "$NOW"
+  exit 0
+fi
 RTS_LOG=$(printf '%s' "$RTS_LOG" | tr ',' '\n' | awk -v now="$NOW" -v w="$RACE_BUDGET_WIN" '$1+0>0 && now-$1<w' | tr '\n' ',' | sed 's/,$//')
 N_RECENT=$(printf '%s' "$RTS_LOG" | awk -F, 'NF>0{n=NF} END{print n+0}')
 if [ "$N_RECENT" -ge "$RACE_BUDGET_H" ]; then

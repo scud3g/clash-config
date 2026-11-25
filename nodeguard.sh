@@ -1,19 +1,180 @@
 #!/bin/sh
 # ============================================================
-# nodeguard.sh v9.7 - pre-race liveness precheck (F22)
-# Base: v9.6 (F1-F21 all retained; 660 non-blank lines / 4DB507F0, 2026-11-24)
-# v9.7 fix (F22):
-#  F22 (P3) A >=3 delay pool still checked one thing only: SIZE. The
-#     old path committed the budget slot and armed the cooldown BEFORE
-#     anyone had proved a single TOPS member was reachable. 3 dead nodes
-#     -> all gates fail -> SEATS<1 -> slot burned for a race that never
-#     measured anything real; worst case inside an hour this is the F13
-#     hole again. Now SECTION 5a pre-probes each TOPS member once with a
-#     single 204 (-m CAND_204_TMO, ~6s for TOP_PICK=3) BEFORE the budget
-#     commit; if EVERY probe fails it is an infrastructure-grade fault -
-#     same semantics as F13/F18 screen faults: no FAIL_N write, no slot,
-#     no cooldown, just log and exit. cur is NOT pre-probed here - it
-#     only enters if all TOPS are dead, and is measured in stage 2 anyway.
+# nodeguard.sh v9.10 - racing ceiling trim to <=100s (scheme B, accepted precision loss)
+# Base: v9.9 (V1-V6; 1209 lines at v9.10 edit start)
+# v9.10 changes (NOT additive: user accepted semantic changes, but the
+# architectural constraints stay - single-file sh + cron no daemon, 4-line
+# state, ASCII-only comments, 100% verifiable answers, no cloud deploy/push):
+#  V7 per-phase timing, OFF by default. NG_TIMING=1 logs a cumulative
+#     wall-clock line "t:<phase>=<Ns>" for S2/S3/S5/6a/6b (T0 set in SECTION 1).
+#  B-racecost ceiling cut from v9.9's 281s to 94s (scheme B). Precision loss:
+#      B1 SPEED_TRIES 3->2 (2 samples = mean, no true median)
+#      B2 TOP_PICK    3->2 (comparison pool shrinks)
+#      B3 group delay -m30->-m15 (slow groups may screen SCREEN_NORESP)
+#      B4 PUT retries 3->2 + rollback single-shot (weaker API: lower success)
+#      B5 6a reuses S3 samples for cur (no fresh re-probe; stab=100 neutral)
+#     Parallelism that makes it cheap (all `&`+`wait`, no semantic change):
+#      S2 version + type/now both fire (same /proxies response parses CUR)
+#      S3 google/204/speed three probes parallel
+#      S5 delay + providers + proxies three requests parallel
+#      6b google + speed_med parallel per candidate
+#     v9.9's 281s bound below is kept AS HISTORY; v9.10 upper bound = 94s.
+# ------------------------------------------------------------------------
+# v9.9 changes (the file below this block is the v9.9 changelog, retained as
+#   history; v9.10 supersedes the ceiling figure, NOT the behavioural notes):
+# v9.9 changes (ADDITIVE ONLY: no threshold, gate, weight or decision
+# rule is touched; the v9.8 sandbox baseline stays directly comparable):
+#  V1 redundant-PUT elimination. GROUP_NOW tracks the group's actual
+#     landing point and is updated ONLY from real get_now readbacks
+#     (put_node's PUT_RET global IS the readback), never guessed. put_node
+#     returns immediately when the requested target equals GROUP_NOW: no
+#     PUT is sent and the target itself is the confirmed value.
+#     MECHANISM (v9.9 fix): put_node reports through the GLOBALS PUT_RET
+#     and GROUP_NOW, NOT through stdout. The first cut used $(put_node ..)
+#     and lost every GROUP_NOW assignment to the command-substitution
+#     subshell: the parent stayed on the SECTION 2 seed value, so a restore
+#     after an all-rejected 6b looked like a no-op and was SKIPPED while the
+#     group actually sat on the last measured candidate (sandbox c3/c11/c12
+#     failed exactly this way). Every call site is now "put_node X; Y=$PUT_RET".
+#     Failure
+#     direction: a stale GROUP_NOW would skip a PUT that should have
+#     happened - but staleness can only come from an external change,
+#     which the next round's SECTION 2 EXT check catches anyway, and
+#     every skippable PUT is a defensive re-assert (keep branch) or a
+#     rollback the readback already proved unnecessary. on_exit resyncs
+#     GROUP_NOW from its own fresh readback BEFORE restoring, so the
+#     TERM path can never mis-skip. Saving is REAL but CONDITIONAL: a PUT
+#     is skippable only when a readable readback already proves the group
+#     sits on the target. Two sites qualify in practice - the keep-branch
+#     re-assert when every 6b candidate was rejected (the group never left
+#     cur) and a rollback to a node a rejected PUT demonstrably left the
+#     group on. Each such skip saves the SUCCESSFUL put cost (10s).
+#     The 281s all-timeout ceiling is NOT reduced: when every probe times
+#     out the readback is unreadable, GROUP_NOW is cleared, and every PUT
+#     still goes out. So the ceiling stays 281s and V1 is a latency win on
+#     the common path, not a ceiling win.
+# V2 failure cause codes. Every failure/skip log line ends with a
+#     stable grep-able "cause=<CODE>" uppercase token:
+#       API_DOWN GROUP_TYPE READ_FAIL EXT_CHANGE SCREEN_NORESP
+#       SCREEN_EMPTY SCREEN_SMALL BUDGET COOLDOWN_MILD SPIKE_WAIT
+#       MILD_WINDOW G204_FAIL GOOGLE_POLLUTED PUT_REJECTED PUT_UNKNOWN
+#       ALL_DEAD RESTORE_FAIL KEEP_REJECTED SWITCH_ROLLBACK
+#     Log layer only; no judgement logic changed.
+#  V3 read-only self-check. "NG_CHECK=1" env or a bare "--check" argv
+#     runs a pre-lock, pre-write check: API reachability, group type,
+#     current selection, mihomo version, providers API answer, cooldown
+#     remaining, budget balance, static cost ceilings. NG_CHECK_DEEP=1
+#     additionally fires ONE stage-1 group-delay call and reports the
+#     RAW entry count (unfiltered; the filtered pool only exists in a
+#     full round). Touches no lock, no state, no log, no group.
+#     Exits 1 if any core check fails.
+#  V4 egress trace, OFF by default. NG_EGRESS=1 logs one cdn-cgi/trace
+#     fetch (ip=/loc=) after a settled round (keep-confirm or confirmed
+#     switch). NG_TRACE_URL overrides. Diagnostic aid only - NOT a
+#     gate; not yet verified on a real router.
+#  V5 version probe in check mode: reports the mihomo version string
+#     and whether /providers/proxies answers, making the M5/F5 degraded
+#     paths visible from check output. Deliberately NO minimum-version
+#     gate: no source basis exists for a hard floor number; hardcoding
+#     one would be a guess.
+#  V6 single version constant NG_VERSION, printed by the per-round log
+#     (was a literal "v9.8" at the log site - the F14 class of bug:
+#     v9.6 shipped logging "v9.3"). mihomo's version keeps its own
+#     variable name NG_VER (distinct).
+# Time-cost note (v9.9 supersedes EVERY older figure in this file):
+#     the v9.8 header carried three stale derivations (195s trade-off 2,
+#     360s S1, 265s legacy S1); all three added mutually exclusive paths
+#     or missed the settle rollback. Corrected arithmetic:
+#       healthy round ceiling   34s (real 3-8s; SECTION 2+3 only)
+#       racing round ceiling  281s = 34 + 55 + 24 + 102 + 66
+#         (S2+S3 / S5 screen / 6a cur / 6b 3x max(34,33) / 7 settle)
+#         V1 does not lower this ceiling (see V1 above: all-timeout means
+#         unreadable readbacks -> no skip). It lowers real rounds only.
+#       worst hourly occupation 2 x 281s = 16%
+#       8min lock threshold margin 480 - 281 = 199s
+#     Corrected in place below; old numbers are quoted AS HISTORY only
+#     where a note explains they were superseded.
+# (v9.8 changelog follows)
+# nodeguard.sh v9.8 - retract F22 precheck, deferred budget commit (F23)
+# Base: v9.7 (F1-F22 code state; 41015 bytes / 812 total lines / 783 non-blank, 2026-11-24)
+# v9.8 fix (F23 + F22 retraction):
+#  F22 RETRACTED (v9.7 -> v9.8). The v9.7 precheck loop issued
+#     "curl ... https://www.gstatic.com/generate_204" inside a
+#     "for N in $(...)" loop but the curl command line never referenced
+#     $N. Every iteration therefore measured whatever node the selector
+#     already pointed at (traffic leaves through the transparent proxy;
+#     see delivery doc section I), i.e. cur - not the TOPS members.
+#     Consequences were exactly inverted from the intent:
+#       - cur healthy -> PC_OK=3 always, precheck filtered nothing and
+#         cost 6s of dead time plus 3 extra 204 probes aimed at cur;
+#       - cur dead    -> PC_OK=0 -> "ERR precheck all TOPS dead" -> exit
+#         WITHOUT racing. The one case a liveness guard must handle was
+#         the one it blocked, every 5 minutes, forever.
+#     Root cause is an implementation bug, NOT an API limitation: the
+#     curl inside the loop never referenced $N, so every iteration probed
+#     whatever the selector already pointed at. A per-member probe IS
+#     available on this API: GET /providers/proxies/{provider}/{name}/
+#     healthcheck exists and reuses the same getProxyDelay handler
+#     (route/provider.go L30-38 -> proxies.go L106-148, which also parses
+#     the "expected" query at L116). Only the PLAIN /proxies/{name}/delay
+#     form is 404 for provider nodes, because provider members never
+#     register in tunnel.Proxies() (proxies.go L46-60, tunnel.go L219).
+#     So v9.7 could have worked had it used the right URL and passed $N;
+#     it used neither. The precheck is still removed in v9.8 rather than
+#     patched, because F23 makes it redundant. Decision (v9.9 candidate,
+#     declined): a correct precheck would use the provider-scoped
+#     healthcheck and would only trim the all-dead round, whose ceiling is
+#     195s but is usually far shorter (see trade-off 2). In exchange it
+#     adds a second probe path that must stay in sync with the stage-2
+#     gates (204 x TRY204, google state, throughput) and would need the
+#     provider name per node, which the screen does not currently carry.
+#     Not worth it: F23 already removed the only real harm (a wasted
+#     slot). F23 supplies the real fix for F19's goal.
+#  F23 (P3, real fix for F19) Budget slot and cooldown are now committed
+#     at the FIRST real seat instead of before the race (SECTION 5a
+#     check only). A race that seats nobody leaves RACE_TS and RTS_LOG
+#     untouched, so an all-dead pool costs neither a cooldown window nor
+#     a budget slot - which is what F19 was reaching for and what F22
+#     failed to deliver. A race that seats >=1 node did generate real
+#     measurement traffic, so its slot is earned.
+#     Accepted trade-off: a round killed by a signal between its first
+#     seat and the following save_state can lose that commit, and the
+#     next round races again. TERM inside a multi-minute round is rare,
+#     and the failure direction is one extra race, never a stuck guard.
+#     Accepted trade-off 2 (cost derived from the script's own timeout
+#     constants, NOT measured on a real box; arithmetic v9.9-corrected:
+#     the original 195s figure added mutually exclusive paths - put_node
+#     failure and measurement never run in the same candidate iteration -
+#     and missed the settle rollback PUT): when cur is dead AND every
+#     TOPS member is also dead, v9.8 runs the full stage-2 race where
+#     v9.7 bailed early. Worst case, every probe hitting its -m ceiling:
+#       S2+S3 always-on : 5+5+5 + 6+5+4+4                =  34s
+#       S5 screen       : 30 + 15 + 10                  =  55s
+#       6a cur          : 3x2(204) + 6(google) + 3x4     =  24s
+#       6b per cand     : max(34 switch-ok, 33 put-fail) =  34s
+#       6b x TOP_PICK 3                                      = 102s
+#       7 settle        : max(33 keep, 66 switch-fail)   =  66s
+#       racing ceiling                                       = 281s
+#     (v9.9 V1 trims a provably redundant PUT when - and only when - a
+#     readable readback proves the group never moved. In the all-timeout
+#     case this ceiling spends, so it stays 281s; real rounds are
+#     shorter by up to 2 x 10s in the rejected-candidate sub-case.)
+#     That 281s is an UPPER BOUND, not a duration: a dead endpoint usually
+#     answers 000 in milliseconds on TCP reset / DNS failure, so a real
+#     round is normally far shorter. No sandbox number is quoted here
+#     because the mock returns instantly and would prove nothing.
+#     This cost is NOT avoidable: distinguishing "all dead" from "cur dead
+#     but a TOPS member alive" is exactly the C2 case v9.7 got wrong, and
+#     the only way to tell them apart is to actually enter the race.
+#     Probes that fail this way move no billable traffic (204/speed
+#     requests that never complete), so the real cost is wall time and API
+#     calls, not quota. Consequence to expect in the log: an all-dead
+#     subscription
+#     produces one full stage-2 round every cron tick (ceiling 281s, real
+#     time normally much shorter) and never arms the
+#     cooldown, i.e. it keeps retrying until the pool recovers. That is
+#     the intended behaviour - a guard that stops trying when every node
+#     is down is worse than one that keeps trying.
 # v9.6 fixes (F16-F21, found by a line-by-line read of v9.5):
 #  F16 (P4) Log trim ran BEFORE the instance lock and used a fixed temp
 #     name ($LOG.new). Two overlapping cron rounds could both tail+mv; the
@@ -41,13 +202,15 @@
 #     the score column is printed with "%.1f", so it is always "0.0". With
 #     CUR_SCORE=0.0 the next awk did b*100/0 -> empty output -> a log line
 #     "margin % under TIE_PCT". The guard now lives inside awk (c+0<=0).
-#  F19 (P3, v9.7: FIXED by F22) S4's pool floor checks POOL SIZE, not the
+#  F19 (P3, v9.8: FIXED by F23) S4's pool floor checks POOL SIZE, not the
 #     number of live candidates; a >=3 pool could still seat nobody and only
-#     found out at the SEATS<1 branch, after the slot was spent. F22 (v9.7)
-#     adds a one-204 precheck per TOPS member BEFORE the budget commit, so
-#     the all-dead path no longer burns slot/cooldown. SEATS<1 can still
-#     fire mid-race (node dies between precheck and its gates) - that is
-#     genuinely measured traffic, the slot was earned by a live precheck.
+#     found out at the SEATS<1 branch, after the slot was spent. v9.7 tried
+#     to fix this with the F22 precheck and the attempt was a no-op that
+#     inverted the behaviour (see F22 RETRACTED at the top). v9.8 fixes it
+#     properly by moving the commit itself: SECTION 5a now only CHECKS
+#     budget/cooldown, and the slot is written at the first real seat
+#     (F23 below). An all-dead pool therefore leaves RACE_TS and RTS_LOG
+#     untouched.
 # Behaviour note: F18 and F20 change what gets written to state and how one
 # scoring input is derived. Decision weights, gates and thresholds are
 # unchanged. Rejected in this pass: "stability score is fake" (N2 already
@@ -110,9 +273,16 @@
 #     kept in the log, so a future API behavior change (see mihomo
 #     commit 85c1798f which moved provider nodes out of /proxies)
 #     can be attributed from the log instead of guessing.
-#  S1 lock stale 4min -> 8min: worst-case round path was measured
-#     ~265s (4.4min) > 4min stale threshold, so a slow-but-alive
-#     round could be stolen by the next cron tick (concurrency race).
+#  S1 lock stale 4min -> 8min: the worst-case round path was put at
+#     ~265s (4.4min) when S1 was introduced, which is > the old 4min
+#     stale threshold, so a slow-but-alive round could be stolen by the
+#     next cron tick (concurrency race). NOTE (v9.9): neither that 265s
+#     figure nor the later 360s v9.8 re-derivation is reproducible - both
+#     added mutually exclusive paths. The v9.9-corrected racing ceiling
+#     is 281s (4.7min), still > 4min, so the 8min threshold still holds
+#     with 199s of margin even if every single probe times out fully
+#     (upper bound, not a duration).
+#     (v9.10 supersedes: ceiling now 94s -> margin 386s; see header block.)
 #     8min sacrifices at most 1 round on a really stuck lock instead.
 #  S2 EXT path stops polluting the baseline: on external change the
 #     old code fell through to the PREV_BPS persist line and overwrote it
@@ -124,7 +294,11 @@
 # Stage1 screen: /group/{SEL}/delay (no unpin side effect,
 #        no per-switch jitter; per-node /proxies/{n}/delay is NOT
 #        usable here: provider nodes never register in tunnel
-#        proxies map -> always 404, verified live + tunnel.go L219)
+#        proxies map -> always 404, verified live + tunnel.go L219.
+#        NOTE: that 404 applies ONLY to the plain /proxies/{n}/delay
+#        form. The provider-scoped form
+#        /providers/proxies/{provider}/{name}/healthcheck is a different
+#        route and does work for provider members (route/provider.go L30-38).)
 # Google states follow v8.1: 1=clean 2=polluted(cn or 000) 0=unknown;
 #        only 2 counts as bad; unknown is tolerated (v8.1 proven).
 #        Severe (204-dead-severe-bps / polluted / very low thr) breaks
@@ -143,18 +317,23 @@ API="$NG_API"
 AH="Authorization: $NG_SECRET"
 SEL="$NG_GROUP_SEL"
 
+# V6 (v9.9): single version constant - the per-round log prints this.
+# (v9.6 F14 shipped logging "v9.3": a literal at the log site is how
+# that happens. The mihomo version keeps its own name NG_VER.)
+NG_VERSION=v9.10
+
 # v9 tunables (override in conf)
 WIN_SEC=${WIN_SEC:-900}          # mild-anomaly window: 2 hits inside window
 FAIL_TRIGGER=${FAIL_TRIGGER:-2}  # hits needed inside window
 RACE_CD=${RACE_CD:-900}          # cooldown after a finished race
 RACE_BUDGET_H=${RACE_BUDGET_H:-2}    # max races per rolling hour (B2)
 RACE_BUDGET_WIN=${RACE_BUDGET_WIN:-3600}  # budget window seconds
-TOP_PICK=${TOP_PICK:-3}          # finalists from stage-1 screen
+TOP_PICK=${TOP_PICK:-2}          # finalists from stage-1 screen (v9.10: 3->2)
 TIE_PCT=${TIE_PCT:-20}           # switch only if best*100 > cur*(100+TIE_PCT)
 THRESH_BPS=${THRESH_BPS:-30720}  # pass line 30KB/s (v8 guard, kept)
 SEVERE_BPS=${SEVERE_BPS:-15360}  # severe line 15KB/s
 SPEED_MAX=${SPEED_MAX:-4}        # single throughput try cap seconds
-SPEED_TRIES=${SPEED_TRIES:-3}    # throughput tries per candidate (median)
+SPEED_TRIES=${SPEED_TRIES:-2}    # throughput tries per candidate (median) (v9.10: 3->2)
 TRY204=${TRY204:-3}              # 204 probes per candidate (success gate)
 CAND_204_TMO=${CAND_204_TMO:-2}
 SPIKE_PCT=${SPIKE_PCT:-20}       # thr drop pct vs last round to flag spike
@@ -164,6 +343,16 @@ W_STAB=${W_STAB:-10}             # stability weight
 SPEED_URL="${SPEED_URL:-https://i.ytimg.com/vi/aqz-KE-bpKQ/maxresdefault.jpg}"
 PROV_TYPES="${PROV_TYPES:-AnyTLS|Hysteria2|Hysteria|Trojan|Vless|Vmess|Shadowsocks|ShadowsocksR|Socks5|Http|Ssh|Tuic|WireGuard|Mieru|Snell|Sudoku|Masque|TrustTunnel|ShadowQuic|OpenVPN|Tailscale|ZeroTier|EasyTier|GostRelay}"
 DRY_RUN=${NG_DRY_RUN:-0}
+# V4 (v9.9): egress trace, OFF by default. NG_EGRESS=1 logs one trace
+# fetch (ip=/loc=) after a settled round. Diagnostic aid only - NOT a
+# gate; not yet verified on a real router. NG_TRACE_URL overrides.
+NG_EGRESS=${NG_EGRESS:-0}
+NG_TRACE_URL="${NG_TRACE_URL:-https://www.cloudflare.com/cdn-cgi/trace}"
+# V7 (v9.10): per-phase timing, OFF by default. NG_TIMING=1 logs the wall
+# clock spent in each racing phase (S2/S3/S5/6a/6b/S7) as "t:phase=Ns" lines.
+# Diagnostic aid only - nothing gates on it. Gives the first REAL distribution
+# of a race round's cost, which the static ceiling (--check) cannot provide.
+NG_TIMING=${NG_TIMING:-0}
 
 # v9 paths (shadow install overrides STATE/LOG via conf)
 STATE="${NG_STATE:-/root/.nodeguard.state}"
@@ -171,6 +360,12 @@ LOG="${NG_LOG:-/root/nodeguard.log}"
 LOCK_DIR="${NG_LOCK:-/tmp/nodeguard_v9.lock}"   # F12: sandboxable lock (default unchanged)
 OFFFILE="${NG_OFF:-/root/.nodeguard.off}"   # F10: sandboxable
 log(){ echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG"; }
+# V7 (v9.10): per-phase race timing. NG_TIMING=1 logs the cumulative wall
+# clock at each racing phase boundary as "t:phase=Ns" (seconds since T0,
+# which is set at SECTION 1). Default OFF: healthy rounds and timing-off
+# rounds add no extra log lines. Diagnostic aid only - nothing gates on it.
+T0=""
+tlog(){ [ "$NG_TIMING" = "1" ] && [ -n "$T0" ] && log "t:$1=$(( $(date +%s) - T0 ))s"; }
 # log trim (v8.1 rule: 200KB cap). F15: keep last 400 lines instead of
 # 100 - a round writes 5-15 lines, so 100 lines only covered ~10-30 rounds
 # and the A1 PREV_BPS fallback (grep the previous "OK [cur]" line) could
@@ -181,30 +376,9 @@ log(){ echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG"; }
 # already-unlinked inode, silently losing its own log lines. Inside the
 # critical section there is only one writer, and $$ avoids a name clash.
 
-# ---- single instance lock (mkdir + stale guard > 8min) ----
-# S1: worst-case round path ~265s (4.4min) > old 4min threshold, so a
-# slow-but-alive round could be stolen by the next cron tick. 8min it is.
-# S3: stale cleanup must run EVEN when mkdir fails. Old code exited on
-# mkdir failure (old v9.3 exited here), so a stale lock (left by a crashed round) made
-# every later round "SKIP another instance" forever, and the -mmin +8
-# cleanup below was NEVER reached. Now: mkdir fails -> still check stale
-# -> reclaim if old enough -> only then give up.
-if ! mkdir "$LOCK_DIR" 2> /dev/null; then
-  if [ -n "$(find "$LOCK_DIR" -mmin +8 2>/dev/null)" ]; then
-    rm -rf "$LOCK_DIR" 2>/dev/null
-    mkdir "$LOCK_DIR" 2>/dev/null || { log "SKIP lock contention after stale reclaim"; exit 0; }
-  else
-    log "SKIP another instance running"
-    exit 0
-  fi
-fi
-trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT INT TERM HUP
-# F16: log trim runs inside the critical section (see note above).
-[ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 204800 ] && tail -400 "$LOG" > "$LOG.$$.new" && mv "$LOG.$$.new" "$LOG"
-
 # ---- helpers ----
 enc(){ printf "%s" "$1" | awk 'BEGIN{for(i=0;i<256;i++)o[sprintf("%c",i)]=i}{n=length($0);for(i=1;i<=n;i++){c=substr($0,i,1);if(c~/[A-Za-z0-9._~-]/)printf"%s",c;else printf"%%%02X",o[c]}}'; }
-get_now(){ curl -s -m 5 -H "$AH" "$API/proxies/$(enc "$SEL")" | tr ',' '\n' | grep -o '"now":"[^"]*"' | head -n1 | sed 's/^"now":"//; s/"$//'; }
+get_now(){ curl -s -m 3 -H "$AH" "$API/proxies/$(enc "$SEL")" | tr ',' '\n' | grep -o '"now":"[^"]*"' | head -n1 | sed 's/^"now":"//; s/"$//'; }
 # F1: exact JSON field parse replaces greedy sed. Verified live: an HTML
 # 502 page, {"error":...}, {"now":""} all yield an empty string now.
 # Keep a defensive blacklist on top (defense in depth): a truncated JSON with
@@ -219,15 +393,42 @@ now_ok(){
   case "$1" in *'"'*|*"'"*|*'\'*|*'{'*|*'}'*|*'<'*|*'>'*|*'`'*) return 1 ;; esac
   return 0
 }
+# V1 (v9.9): GROUP_NOW = the group's actual landing point, assigned ONLY
+# from a real get_now readback (never guessed, never persisted across runs).
+# put_node uses it to skip a PUT that is provably a no-op. Empty means
+# "unknown", which makes every PUT go out - the safe default.
+GROUP_NOW=""
+PUT_RET=""
+PK_SKIP=0
 put_node(){
-  N="$1"; k=0
-  while [ $k -lt 3 ]; do
+  # Private variable names: k / N / A are live loop variables in the caller
+  # (for N in $RACE_LIST, the 204 retry counters, speed_med). Because this
+  # function now runs in the CALLER's shell, clobbering them would corrupt
+  # the loops around every call site.
+  _pn="$1"
+  # V1 fast path: the group is already known to sit on the requested
+  # target, so the PUT cannot change anything. The target itself is the
+  # confirmed value (it IS what a readback would return).
+  if [ -n "$GROUP_NOW" ] && [ "$GROUP_NOW" = "$_pn" ]; then
+    PK_SKIP=$((PK_SKIP+1))
+    log "PUT skip#${PK_SKIP} [$_pn] already selected, redundant PUT avoided (V1)"
+    PUT_RET="$_pn"; return
+  fi
+  _pk=0; _pa=""
+  while [ $_pk -lt 2 ]; do
     curl -s -m 5 -X PUT -H "$AH" -H "Content-Type: application/json" \
-      -d "{\"name\":\"$N\"}" "$API/proxies/$(enc "$SEL")" >/dev/null 2>&1
-    A=$(get_now); [ "$A" = "$N" ] && { echo "$A"; return; }
-    k=$((k+1)); sleep 1
+      -d "{\"name\":\"$_pn\"}" "$API/proxies/$(enc "$SEL")" >/dev/null 2>&1
+    _pa=$(get_now)
+    if [ "$_pa" = "$_pn" ]; then GROUP_NOW="$_pa"; PUT_RET="$_pa"; return; fi
+    # A readable but different _pa is a genuine readback: record it, so a
+    # later PUT back to that same node can also skip (V1). An UNREADABLE
+    # _pa proves nothing about where the group is, so GROUP_NOW is CLEARED
+    # (unknown): the next PUT always goes out. Skipping on a guess is
+    # exactly the failure mode V1 must not introduce.
+    if [ -n "$_pa" ] && now_ok "$_pa"; then GROUP_NOW="$_pa"; else GROUP_NOW=""; fi
+    _pk=$((_pk+1)); sleep 1
   done
-  echo "$A"
+  PUT_RET="$_pa"
 }
 # google check (v8.1 proven flow): 1=clean (real google, 429 ok),
 #   2=polluted (google.cn landing or dead 000), 0=unknown landing
@@ -264,10 +465,131 @@ speed_med(){
 }
 
 # ============================================================
+# V3 (v9.9): read-only self-check, BEFORE the lock and before any write
+# ============================================================
+# Trigger: NG_CHECK=1 in the environment, or a bare "--check" argv.
+# Contract: touches NO lock, NO state file, NO log file, NO proxy group.
+# Only GET requests are issued (plus one group-delay call with
+# NG_CHECK_DEEP=1, which is still read-only on the group - the delay
+# endpoint probes members without re-selecting anything, which is the
+# same property SECTION 5 relies on).
+# Output goes to stdout in "KEY=value" form so it can be grepped or
+# pasted into a report. Exit status: 0 = all core checks passed,
+# 1 = at least one core check failed (API / group type / selection).
+NG_CHECK=${NG_CHECK:-0}
+for a in "$@"; do [ "$a" = "--check" ] && NG_CHECK=1; done
+if [ "$NG_CHECK" = "1" ]; then
+  CHK_FAIL=0
+  # -- core 1: version endpoint reachable (also V5) --
+  CV=$(curl -s -m 5 -H "$AH" "$API/version" 2>/dev/null)
+  CVN=$(printf '%s' "$CV" | tr ',' '\n' | grep -o '"version":"[^"]*"' | head -n1 | cut -d'"' -f4)
+  case "$CVN" in ""|*[!-.A-Za-z0-9+]*) CVN="" ;; esac
+  if [ -n "$CVN" ]; then echo "check_api=ok"; else echo "check_api=FAIL"; CHK_FAIL=1; fi
+  echo "check_script=$NG_VERSION"
+  echo "check_mihomo_version=${CVN:-unreadable}"
+  # -- core 2: group type must be Selector (same invariant as the round) --
+  CT=$(curl -s -m 5 -H "$AH" "$API/proxies/$(enc "$SEL")" 2>/dev/null | tr ',' '\n' | grep -o '"type":"[^"]*"' | head -n1 | sed 's/^"type":"//; s/"$//')
+  case "$CT" in
+    Selector) echo "check_group_type=Selector" ;;
+    "")       echo "check_group_type=FAIL_UNREADABLE"; CHK_FAIL=1 ;;
+    *)        echo "check_group_type=FAIL_${CT}_NOT_SELECTOR"; CHK_FAIL=1 ;;
+  esac
+  # -- core 3: readable current selection --
+  CCUR=$(get_now)
+  if now_ok "$CCUR"; then echo "check_selection=[$CCUR]"; else echo "check_selection=FAIL"; CHK_FAIL=1; fi
+  # -- info: providers API answer, i.e. is the M5/F5 path alive? (V5) --
+  CPV=$(curl -s -m 10 -H "$AH" "$API/providers/proxies" 2>/dev/null)
+  if [ -n "$CPV" ]; then
+    CPVN=$(printf '%s' "$CPV" | tr '{' '\n' | grep -c '"name":"')
+    echo "check_providers_api=ok entries=$CPVN"
+  else
+    echo "check_providers_api=DOWN (round would use the M5 degraded keyword-only filter)"
+  fi
+  # -- info: cooldown + budget from the state file (READ ONLY, no save) --
+  CFAIL=0; CTS=0; CRACE=0; CRTS=""
+  if [ -f "$STATE" ]; then
+    S1V=$(sed -n 1p "$STATE"); S3V=$(sed -n 3p "$STATE")
+    case "$S1V" in
+      v9:*) CB=${S1V#v9:}
+            case "$CB" in
+              *:*:*)
+                CFAIL=${CB%%:*}; CT=${CB#*:}; CTS=${CT%%:*}; CRACE=${CT#*:} ;;
+              *:*)  CFAIL=${CB%%:*}; CTS=${CB#*:} ;;
+              *)    CFAIL=$CB ;;
+            esac ;;
+    esac
+    case "$S3V" in RTS_LOG=*) CRTS=${S3V#RTS_LOG=} ;; esac
+    case "$CFAIL" in ''|*[!0-9]*) CFAIL=0 ;; esac
+    case "$CRACE" in ''|*[!0-9]*) CRACE=0 ;; esac
+    case "$CTS"   in ''|*[!0-9]*) CTS=0 ;; esac
+    echo "check_state_file=present"
+  else
+    echo "check_state_file=absent (first run would initialise it)"
+  fi
+  CNOW=$(date +%s)
+  if [ "$CRACE" -gt 0 ] && [ $((CNOW-CRACE)) -lt "$RACE_CD" ]; then
+    echo "check_cooldown_remaining=$((RACE_CD-(CNOW-CRACE)))s of ${RACE_CD}s"
+  else
+    echo "check_cooldown_remaining=0s (not cooling down)"
+  fi
+  CREC=$(printf '%s' "$CRTS" | tr ',' '\n' | awk -v now="$CNOW" -v w="$RACE_BUDGET_WIN" '$1+0>0 && now-$1<w' | grep -c .)
+  echo "check_budget_used=${CREC:-0}/${RACE_BUDGET_H} in ${RACE_BUDGET_WIN}s"
+  echo "check_fail_counter=$CFAIL/${FAIL_TRIGGER}"
+  # -- static cost model, derived from this file's own -m constants --
+  echo "check_ceiling_healthy_s=$((5+5+5+6+5+4+4))"
+  echo "check_ceiling_racing_s=94 (v9.10 scheme-B all-timeout upper bound; see cost_v910.py)"
+  echo "check_lock_threshold=480s margin_vs_94s=$((480-94))s"
+  # -- optional deep probe: ONE raw group-delay call --
+  if [ "${NG_CHECK_DEEP:-0}" = "1" ]; then
+    CDJ=$(curl -s -m 30 -H "$AH" "$API/group/$(enc "$SEL")/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=3000" 2>/dev/null)
+    if [ -n "$CDJ" ]; then
+      CDN=$(printf '%s' "$CDJ" | sed 's/^[{]*//; s/[}]*$//; s/"//g' | tr ',' '\n' | grep -c ':')
+      echo "check_deep_raw_delay_entries=$CDN (RAW, unfiltered: groups/info nodes included)"
+    else
+      echo "check_deep_raw_delay_entries=FAIL_no_response"
+    fi
+  fi
+  if [ "$CHK_FAIL" = "1" ]; then
+    echo "check_result=FAIL"
+    exit 1
+  fi
+  echo "check_result=ok"
+  exit 0
+fi
+
+# ---- single instance lock (mkdir + stale guard > 8min) ----
+# S1: the original justification put the worst-case round at ~265s
+# (4.4min) > the old 4min threshold, so a slow-but-alive round could be
+# stolen by the next cron tick. Neither 265s nor the 360s v9.8 figure is
+# reproducible (mutually exclusive paths added); the v9.9-corrected
+# racing ceiling was 281s (4.7min), still > 4min, so 8min remained
+# correct with 199s of margin. v9.10 (scheme B) trims the all-timeout
+# ceiling to 94s (see header + cost_v910.py), margin 480-94=386s, so
+# 8min holds with far more headroom.
+# S3: stale cleanup must run EVEN when mkdir fails. Old code exited on
+# mkdir failure (old v9.3 exited here), so a stale lock (left by a crashed round) made
+# every later round "SKIP another instance" forever, and the -mmin +8
+# cleanup below was NEVER reached. Now: mkdir fails -> still check stale
+# -> reclaim if old enough -> only then give up.
+if ! mkdir "$LOCK_DIR" 2> /dev/null; then
+  if [ -n "$(find "$LOCK_DIR" -mmin +8 2>/dev/null)" ]; then
+    rm -rf "$LOCK_DIR" 2>/dev/null
+    mkdir "$LOCK_DIR" 2>/dev/null || { log "SKIP lock contention after stale reclaim"; exit 0; }
+  else
+    log "SKIP another instance running"
+    exit 0
+  fi
+fi
+trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT INT TERM HUP
+# F16: log trim runs inside the critical section (see note above).
+[ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 204800 ] && tail -400 "$LOG" > "$LOG.$$.new" && mv "$LOG.$$.new" "$LOG"
+
+# ============================================================
 # SECTION 1: state (v9:FAIL:TS:RTS + LEDGER line)
 # ============================================================
 FAIL_N=0; LAST_TS=0; RACE_TS=0; LEDGER=""; RTS_LOG=""; PREV_BPS=0
 NOW=$(date +%s)
+[ "$NG_TIMING" = "1" ] && T0=$NOW
 SPIKE_FLAG=0
 if [ -f "$STATE" ]; then
   SV=$(sed -n 1p "$STATE"); SL=$(sed -n 2p "$STATE"); R3=$(sed -n 3p "$STATE"); R4=$(sed -n 4p "$STATE")
@@ -312,40 +634,67 @@ fi
 # future mihomo commit changes /proxies structure (85c1798f precedent:
 # provider nodes were moved out of /proxies), the log answers "why did
 # F5/F10 suddenly behave differently" without guesswork.
-VER_RESP=$(curl -s -m 5 -H "$AH" "$API/version" 2>/dev/null)
-[ -z "$VER_RESP" ] && { log "WARN mihomo api unreachable, skip"; exit 0; }
+# V7 (v9.10): S2's version + group-type/now reads are independent local GETs,
+# so they launch in parallel (ceiling 3+3=6s -> 3s). Both tightened
+# -m5->-m3: 127.0.0.1 API answers in <100ms; a 3s cap only trims the all-down
+# timeout. CUR (the group's landing) is parsed from the SAME response that
+# yields the type, so no second read is needed.
+VER_F=/tmp/ng9_ver.$$
+TYP_F=/tmp/ng9_typ.$$
+curl -s -m 3 -H "$AH" "$API/version" > "$VER_F" 2>/dev/null &
+curl -s -m 3 -H "$AH" "$API/proxies/$(enc "$SEL")" > "$TYP_F" 2>/dev/null &
+wait
+VER_RESP=$(cat "$VER_F"); rm -f "$VER_F"
+[ -z "$VER_RESP" ] && { log "WARN mihomo api unreachable, skip cause=API_DOWN"; exit 0; }
 NG_VER=$(printf '%s' "$VER_RESP" | tr ',' '\n' | grep -o '"version":"[^"]*"' | head -n1 | cut -d'"' -f4)
 case "$NG_VER" in ""|*[!-.A-Za-z0-9+]*) NG_VER=unreadable ;; esac
-log "RUN v9.7 mihomo=$NG_VER"
+log "RUN $NG_VERSION mihomo=$NG_VER"
 # F10: runtime assert - SEL must be a Selector group. If someone changes
 # the group type to url-test/fallback, /group/{SEL}/delay would UNPIN it
 # (route_groups.go L62-65: only non-Selector groups get ForceSet("")),
 # which breaks the "no unpin side effect" invariant. Refuse + alert.
-SEL_TYPE=$(curl -s -m 5 -H "$AH" "$API/proxies/$(enc "$SEL")" | tr ',' '\n' | grep -o '"type":"[^"]*"' | head -n1 | sed 's/^"type":"//; s/"$//')
+SEL_TYPE=$(tr ',' '\n' < "$TYP_F" | grep -o '"type":"[^"]*"' | head -n1 | sed 's/^"type":"//; s/"$//')
 case "$SEL_TYPE" in
   Selector) : ;;
-  "")      log "WARN cannot read group type, skip round"; exit 0 ;;
-  *)       log "ERR group [$SEL] type is [$SEL_TYPE] not Selector; stage-1 delay would UNPIN it, REFUSE to run. Fix NG_GROUP_SEL or yaml."; exit 0 ;;
+  "")      log "WARN cannot read group type, skip round cause=GROUP_TYPE"; exit 0 ;;
+  *)       log "ERR group [$SEL] type is [$SEL_TYPE] not Selector; stage-1 delay would UNPIN it, REFUSE to run. Fix NG_GROUP_SEL or yaml. cause=GROUP_TYPE"; exit 0 ;;
 esac
-CUR=$(get_now)
-now_ok "$CUR" || { log "WARN read selector failed (bad response [$CUR]), skip"; exit 0; }
+CUR=$(tr ',' '\n' < "$TYP_F" | grep -o '"now":"[^"]*"' | head -n1 | sed 's/^"now":"//; s/"$//'); rm -f "$TYP_F"
+now_ok "$CUR" || { log "WARN read selector failed (bad response [$CUR]), skip cause=READ_FAIL"; exit 0; }
+# V1: this get_now is a REAL readback of the group's landing point, so it
+# seeds GROUP_NOW. Every later put_node to the same node can skip its PUT.
+GROUP_NOW="$CUR"
 [ -n "$LEDGER" ] || LEDGER="$CUR"
 if [ "$LEDGER" != "$CUR" ]; then
   # S2: do NOT fall through to the PREV_BPS persist line - that
   # polluted the spike baseline with a measurement of a node nobody
   # evaluated. Sync ledger, zero the baseline, let next round re-seed.
-  log "EXT external change [$LEDGER] -> [$CUR] (manual/panel/restart), ledger synced, baseline reset, no action"
+  log "EXT external change [$LEDGER] -> [$CUR] (manual/panel/restart), ledger synced, baseline reset, no action cause=EXT_CHANGE"
   LEDGER="$CUR"; PREV_BPS=0
   save_state "$FAIL_N" "$NOW"
   exit 0
 fi
+tlog S2
 
 # ============================================================
 # SECTION 3: health check (v8 logic) + spike confirm (A1)
 # ============================================================
-G=$(google_check)
-R204=$(curl -s -o /dev/null -w "%{http_code}" -m 5 "https://www.gstatic.com/generate_204" 2>/dev/null)
-BEST_BPS=$(speed_once); [ -z "$BEST_BPS" ] && BEST_BPS=0
+# V7 (v9.10): S3's three health probes are INDEPENDENT, so they launch in
+# parallel (ceiling max(6,5,4)=6s instead of 6+5+4=15s). google + 204 are
+# zero-download; speed_once is the only download and does not share the
+# tunnel with them, so the parallel launch cannot skew its median. The
+# F7 re-test stays serial (it depends on SUSPECT).
+G_F=/tmp/ng9_g.$$
+R_F=/tmp/ng9_r.$$
+B_F=/tmp/ng9_b.$$
+( google_check > "$G_F" ) &
+( curl -s -o /dev/null -w "%{http_code}" -m 5 "https://www.gstatic.com/generate_204" > "$R_F" 2>/dev/null ) &
+( speed_once > "$B_F" ) &
+wait
+G=$(cat "$G_F"); rm -f "$G_F"
+R204=$(cat "$R_F"); rm -f "$R_F"
+BEST_BPS=$(cat "$B_F"); rm -f "$B_F"
+[ -z "$BEST_BPS" ] && BEST_BPS=0
 SUSPECT=0
 [ "$R204" != "204" ] && SUSPECT=1
 [ "$BEST_BPS" -lt "$THRESH_BPS" ] && SUSPECT=1
@@ -377,6 +726,7 @@ if [ "$RACE_TS" -gt 0 ] && [ $((NOW-RACE_TS)) -lt "$RACE_CD" ]; then REM=$((RACE
 # F8: persist this round's observed bps as PREV_BPS for next round
 [ "$BEST_BPS" -gt 0 ] 2>/dev/null && PREV_BPS=$BEST_BPS
 log "OK [$CUR] google=$GW 204=$R204 bps=$BEST_BPS fail=${FAIL_N}/${FAIL_TRIGGER} rcd=${REM}s spike=${SPIKE_FLAG}"
+tlog S3
 
 # ============================================================
 # SECTION 4: verdict with window + race cooldown gate
@@ -395,14 +745,14 @@ if [ "$RACE_TS" -gt 0 ] && [ $((NOW-RACE_TS)) -lt "$RACE_CD" ]; then
   REM=$(( RACE_CD-(NOW-RACE_TS) ))
   if [ $BAD -eq 1 ]; then
     if [ "$SPIKE_FLAG" -eq 1 ] && [ "$SEVERE" -eq 0 ]; then
-      log "WARN [$CUR] anomaly in cooldown but spike unconfirmed, wait"
+      log "WARN [$CUR] anomaly in cooldown but spike unconfirmed, wait cause=SPIKE_WAIT"
       FAIL_N=$((FAIL_N+1)); LAST_TS=$NOW; save_state "$FAIL_N" "$NOW"; exit 0
     fi
     if [ $SEVERE -eq 1 ]; then
       log "WARN [$CUR] SEVERE breaks cooldown gate"
       REASON="severe-in-cooldown"; NEED_RACE=1
     else
-      log "WARN [$CUR] mild anomaly suppressed by cooldown ${REM}s left"
+      log "WARN [$CUR] mild anomaly suppressed by cooldown ${REM}s left cause=COOLDOWN_MILD"
       FAIL_N=$((FAIL_N+1)); LAST_TS=$NOW; save_state "$FAIL_N" "$NOW"; exit 0
     fi
   else
@@ -424,7 +774,7 @@ else
       if [ "$FAIL_N" -ge "$FAIL_TRIGGER" ]; then
         REASON="mild-window"; NEED_RACE=1
       else
-        log "WARN [$CUR] mild anomaly(spike) window hit ${FAIL_N}/${FAIL_TRIGGER}, no race yet"
+        log "WARN [$CUR] mild anomaly(spike) window hit ${FAIL_N}/${FAIL_TRIGGER}, no race yet cause=MILD_WINDOW"
         save_state "$FAIL_N" "$NOW"; exit 0
       fi
     else
@@ -432,7 +782,7 @@ else
       if [ "$FAIL_N" -ge "$FAIL_TRIGGER" ]; then
         REASON="mild-window"; NEED_RACE=1
       else
-        log "WARN [$CUR] mild anomaly window hit ${FAIL_N}/${FAIL_TRIGGER}, no race yet"
+        log "WARN [$CUR] mild anomaly window hit ${FAIL_N}/${FAIL_TRIGGER}, no race yet cause=MILD_WINDOW"
         save_state "$FAIL_N" "$NOW"; exit 0
       fi
     fi
@@ -449,18 +799,18 @@ fi
 # SECTION 5: stage-1 screen via group delay (no unpin, no switch)
 # ============================================================
 SELU=$(enc "$SEL")
-DELAY_JSON=$(curl -s -m 30 -H "$AH" "$API/group/$SELU/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=3000" 2>/dev/null)
-[ -z "$DELAY_JSON" ] && { log "ERR screen no response, keep [$CUR]"; save_state "$FAIL_N" "$NOW"; exit 0; }
-
-# parse layer 0: last-colon split (v8 rules)
-# layer 1: keyword junk filter (v8 rules, kept as defense in depth:
-#          billing/info nodes share protocol types, keywords still needed)
-# layer 2 (M5): keep only protocol-typed real nodes from providers API;
-#          groups / DIRECT / REJECT are excluded by type, not by name guessing
+# V7 (v9.10): S5's three read-only GETs (group-delay / providers / proxies)
+# are INDEPENDENT (no data dependency), so they launch in parallel and the
+# ceiling drops from 15+15+10=40s to max(15,15,10)=15s. All three are
+# zero-download API probes - none contests the tunnel bandwidth, so the
+# parallel launch cannot skew a throughput median (unlike speed_once, which
+# stays serial for exactly that reason). The $$ names keep concurrent cron
+# rounds (if any) from colliding.
 TYPE_F=/tmp/ng9_types.$$
 GRP_F=/tmp/ng9_grps.$$
+DLY_F=/tmp/ng9_delay.$$
 TYPE_N=0
-# awk index-extraction; keep only real protocol-typed nodes (M5)
+curl -s -m 15 -H "$AH" "$API/group/$SELU/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=3000" > "$DLY_F" 2>/dev/null &
 curl -s -m 15 -H "$AH" "$API/providers/proxies" 2>/dev/null | tr '{' '\n' | awk -v t="$PROV_TYPES" '
   BEGIN { n = split(t, a, "|"); for (i=1;i<=n;i++) w[a[i]] = 1 }
   {
@@ -469,7 +819,19 @@ curl -s -m 15 -H "$AH" "$API/providers/proxies" 2>/dev/null | tr '{' '\n' | awk 
     t1 = index($0, "\"type\":\""); if (!t1) next
     r2 = substr($0, t1+8); t2 = index(r2, "\""); if (!t2) next; typ = substr(r2, 1, t2-1)
     if (w[typ]) print name "\t" typ
-  }' > "$TYPE_F"
+  }' > "$TYPE_F" &
+curl -s -m 10 -H "$AH" "$API/proxies" 2>/dev/null \
+  | tr '{' '\n' | grep -o '"name":"[^"]*"' | sed 's/^"name":"//; s/"$//' \
+  | sort -u > "$GRP_F" &
+wait
+DELAY_JSON=$(cat "$DLY_F"); rm -f "$DLY_F"
+[ -z "$DELAY_JSON" ] && { log "ERR screen no response, keep [$CUR] cause=SCREEN_NORESP"; save_state "$FAIL_N" "$NOW"; exit 0; }
+
+# parse layer 0: last-colon split (v8 rules)
+# layer 1: keyword junk filter (v8 rules, kept as defense in depth:
+#          billing/info nodes share protocol types, keywords still needed)
+# layer 2 (M5): keep only protocol-typed real nodes from providers API;
+#          groups / DIRECT / REJECT are excluded by type, not by name guessing
 TYPE_N=$(grep -c . "$TYPE_F" 2>/dev/null)
 TPS_ALL=$(echo "$DELAY_JSON" | sed 's/^[{]*//; s/[}]*$//; s/"//g' | tr ',' '\n' \
   | awk -F: 'BEGIN{OFS=":"} NF>1 && $NF ~ /^[0-9]+$/ { d=$NF; NF--; print d "\t" $0 }' \
@@ -492,7 +854,7 @@ if [ "${GRP_N:-0}" -gt 0 ] 2>/dev/null; then
   TPS_G=$(printf '%s\n' "$TPS_ALL" | awk -F'\t' 'NR==FNR{g[$0]=1;next} NF>1 && !($2 in g)' "$GRP_F" -)
   TPS_ALL=$TPS_G
 else
-  log "WARN /proxies group set unreadable, group subtraction skipped (F5 degraded)"
+  log "WARN /proxies group set unreadable, group subtraction skipped (F5 degraded) cause=SCREEN_EMPTY"
 fi
 rm -f "$GRP_F"; GRP_F=""
 if [ -n "$TPS_ALL" ] && [ "$TYPE_N" -gt 0 ] 2>/dev/null; then
@@ -514,24 +876,23 @@ screen_cnt=$(printf '%s\n' "$TPS_ALL" | grep -c .)
 # reason nothing had measured - the same half-accounting F13 removed from the
 # budget/cooldown side. Keep the counter untouched and just log.
 if [ -z "$TPS_ALL" ] || [ "$screen_cnt" -lt 1 ]; then
-  log "ERR screen produced nothing, keep [$CUR]"; save_state "$FAIL_N" "$NOW"; exit 0
+  log "ERR screen produced nothing, keep [$CUR] cause=SCREEN_EMPTY"; save_state "$FAIL_N" "$NOW"; exit 0
 fi
 # S4: pool floor - a 1-2 node screen is too small to race meaningfully
 # (TOP_PICK=3 can never fill, and a race over a tiny pool has a high
 # chance of just re-validating the current node while burning budget).
 # Keep current, log clearly, don't race. Only <1 (empty) was guarded
 # before; now <3 bails too.
-# NOTE (F19, v9.7: fixed by the F22 precheck below in SECTION 5a): this
+# NOTE (F19, v9.8: fixed by F23, not by the retracted F22 precheck): this
 # floor checks POOL SIZE, not LIVE-CANDIDATE count. The pool is built from
 # group-delay replies, and stage-2 still re-gates every candidate on 204 +
-# google. A >=3 pool can still yield zero seats (all TOPS dead); before v9.7
-# that path was only caught at the SEATS<1 branch - after the budget slot was
-# already spent. The F22 precheck now re-probes each TOPS member once BEFORE
-# the budget commit, so the all-dead case exits without burning a slot;
-# SEATS<1 mid-race (node dying after its precheck passed) still spends the
-# slot, but then real measurement traffic was generated - the slot was earned.
+# google. A >=3 pool can still yield zero seats (all TOPS dead). v9.7 tried
+# to catch that with a pre-race precheck; that precheck measured cur rather
+# than TOPS (F22 retracted) and blocked the one case it was meant to help.
+# v9.8 instead defers the budget/cooldown commit to the first real seat
+# (F23), so the all-dead path simply spends nothing and retries next tick.
 if [ "$screen_cnt" -lt 3 ]; then
-  log "WARN screen pool too small to race ($screen_cnt nodes < 3), keep [$CUR]"
+  log "WARN screen pool too small to race ($screen_cnt nodes < 3), keep [$CUR] cause=SCREEN_SMALL"
   save_state "$FAIL_N" "$NOW"
   exit 0
 fi
@@ -543,6 +904,7 @@ if [ "${screen_cnt:-0}" -gt 80 ] 2>/dev/null; then
 fi
 TOPS=$(printf '%s\n' "$TPS_ALL" | sort -n | head -"$TOP_PICK" | cut -f2-)
 log "  screen TOP${TOP_PICK}: $(printf '%s' "$TOPS" | tr '\n' ' ') (from $screen_cnt, typed=$TYPE_N)"
+tlog S5
 
 # ---- shadow exit: measurement-without-switch would be fake ----
 # NOTE (F13): DRY_RUN exits here, i.e. BEFORE the budget commit, so a
@@ -553,50 +915,41 @@ if [ "$DRY_RUN" = "1" ]; then
 fi
 
 # ============================================================
-# SECTION 5a: race budget + cooldown commit (F13: after screen)
+# SECTION 5a: race budget + cooldown CHECK ONLY (F23)
 # ============================================================
 # Budget is a hard ceiling per rolling window; severe does NOT break it.
-# Committing here (not in SECTION 4) means only a race that will really
-# run costs a slot or starts the cooldown clock.
-# ---- F22 (v9.7): pre-race liveness precheck ----
-# One 204 probe per TOPS member BEFORE the budget commit. If EVERY probe
-# fails the race has nothing to measure - infrastructure-grade fault, same
-# semantics as F13/F18 screen faults: no FAIL_N write, no budget slot, no
-# cooldown; distinct log tag ("ERR precheck") so its rate can be counted.
-# Cost when healthy: TOP_PICK x CAND_204_TMO = 3 x 2s = 6s extra worst
-# case, still inside the S1 265s + margin. cur is NOT pre-probed: it only
-# matters when all TOPS are dead, and stage 2 measures it under the old
-# gates anyway.
-PC_OK=0
-PC_TOT=0
-for N in $(printf '%s' "$TOPS" | tr '\n' ' '); do
-  [ -z "$N" ] && continue
-  PC_TOT=$((PC_TOT+1))
-  C1=$(curl -s -o /dev/null -w "%{http_code}" -m "$CAND_204_TMO" "https://www.gstatic.com/generate_204" 2>/dev/null)
-  [ "$C1" = "204" ] && PC_OK=$((PC_OK+1))
-done
-if [ "${PC_TOT:-0}" -lt 1 ] 2>/dev/null; then
-  log "ERR precheck no TOPS member to probe, keep [$CUR]"
-  save_state "$FAIL_N" "$NOW"
-  exit 0
-fi
-if [ "$PC_OK" -lt 1 ]; then
-  log "ERR precheck all TOPS dead (0/$PC_TOT), keep [$CUR] - infra fault, no slot spent"
-  save_state "$FAIL_N" "$NOW"
-  exit 0
-fi
+# F13 moved these writes here (out of SECTION 4) so a failed or too-small
+# screen could not arm RACE_CD or burn a slot for a race that never ran.
+# F23 (v9.8) moves them one step further: this section now only CHECKS,
+# and the commit happens at the first real seat in SECTION 6b. A race
+# that seats nobody (every TOPS member dead at the gates) costs neither
+# a cooldown window nor a budget slot - the goal F19 wanted, and exactly
+# what v9.7's F22 precheck failed to deliver (it probed cur, not TOPS).
+# ---- F22 RETRACTED (v9.8): this section deliberately does NOT precheck ----
+# The v9.7 precheck is gone, but NOT because a per-member probe is
+# impossible: /providers/proxies/{provider}/{name}/healthcheck does exist
+# (route/provider.go L30-38 -> getProxyDelay in proxies.go L106-148). That
+# handler parses url, timeout and expected from the query string
+# (proxies.go L108, L109, L116), so the provider-scoped form takes the
+# same parameters as /proxies/{name}/delay. [source-verified, not probed
+# on the router] What was
+# broken was the call site: its curl never referenced $N, so it measured
+# cur three times (see the header note). The plain /proxies/{name}/delay
+# form is the only one that 404s for provider members (proxies.go L46-60).
+# A correct precheck is therefore implementable but redundant after F23:
+#     it would only trim the all-dead round (ceiling 281s, normally far
+#     shorter; see trade-off 2, v9.9-corrected) at the price of
+# a second probe path kept in sync with the stage-2 gates. Not done here.
 RTS_LOG=$(printf '%s' "$RTS_LOG" | tr ',' '\n' | awk -v now="$NOW" -v w="$RACE_BUDGET_WIN" '$1+0>0 && now-$1<w' | tr '\n' ',' | sed 's/,$//')
 N_RECENT=$(printf '%s' "$RTS_LOG" | awk -F, 'NF>0{n=NF} END{print n+0}')
 if [ "$N_RECENT" -ge "$RACE_BUDGET_H" ]; then
-  log "WARN [$CUR] race budget exhausted (${N_RECENT}/${RACE_BUDGET_H} in ${RACE_BUDGET_WIN}s), keep cur"
+  log "WARN [$CUR] race budget exhausted (${N_RECENT}/${RACE_BUDGET_H} in ${RACE_BUDGET_WIN}s), keep cur cause=BUDGET"
   save_state "$FAIL_N" "$NOW"
   exit 0
 fi
-RTS_LOG="$RTS_LOG,$NOW"
-[ -z "${RTS_LOG%,*}" ] && RTS_LOG="$NOW"
-RACE_TS=$NOW
-save_state "$FAIL_N" "$NOW"
-log "RACE start reason=$REASON cur=[$CUR] budget=$((N_RECENT+1))/${RACE_BUDGET_H}"
+# F23: nothing is written here on purpose. RTS_LOG/RACE_TS are committed
+# in SECTION 6b as soon as a candidate (or cur) earns its first seat.
+log "RACE start reason=$REASON cur=[$CUR] budget=$((N_RECENT+1))/${RACE_BUDGET_H} (commit deferred to first seat, F23)"
 
 # ============================================================
 # SECTION 6: stage-2 race, cur-first, per-switch confirm
@@ -615,37 +968,80 @@ on_exit(){
   [ "$SW_DONE" = "1" ] && exit 0
   CN=$(get_now); now_ok "$CN" || exit 0
   [ "$CN" = "$CUR" ] && exit 0
+  # V1: CN is a real readback, so it is the truth about GROUP_NOW. Resync
+  # BEFORE the restore, otherwise a stale GROUP_NOW could make put_node
+  # skip the very restore this trap exists to perform.
+  GROUP_NOW="$CN"
   # F2: capture the result; only claim "restored" if it really happened.
   # Old v9.1 threw the return value away and always logged "restored",
   # so a failed recovery read as success (worst case: TERM landed on a
   # candidate while it was being measured).
-  RB=$(put_node "$CUR")
+  put_node "$CUR"; RB="$PUT_RET"
   if [ "$RB" = "$CUR" ]; then
     log "TRAP exit mid-race: group was [$CN], restored [$CUR]"
   else
-    log "ERR TRAP restore FAILED (wanted [$CUR], actual [$RB]) - group left on [$CN]!!! MANUAL CHECK REQUIRED"
+    log "ERR TRAP restore FAILED (wanted [$CUR], actual [$RB]) - group left on [$CN]!!! MANUAL CHECK REQUIRED cause=RESTORE_FAIL"
   fi
   exit 0
 }
 trap 'on_exit' EXIT INT TERM HUP
+
+# ---- F23 (v9.8): commit budget slot + cooldown at the FIRST real seat ----
+# SECTION 5a only checked. Nothing is spent until some node actually
+# passed the 204 + google gates and produced a score row in RACE_RES:
+# that is real measurement traffic, so the slot is earned there and
+# nowhere earlier. An all-dead race therefore leaves RACE_TS and RTS_LOG
+# untouched and the next cron tick may race again immediately.
+# Idempotent by BUDGET_COMMITTED; called from both seat sites (cur in 6a,
+# candidates in 6b).
+BUDGET_COMMITTED=0
+commit_seat(){
+  [ "$BUDGET_COMMITTED" = "1" ] && return 0
+  BUDGET_COMMITTED=1
+  RTS_LOG="$RTS_LOG,$NOW"
+  [ -z "${RTS_LOG%,*}" ] && RTS_LOG="$NOW"
+  RACE_TS=$NOW
+  save_state "$FAIL_N" "$NOW"
+  log "  race budget committed at first seat (F23): slots=$((N_RECENT+1))/${RACE_BUDGET_H} cd=${RACE_CD}s"
+}
+# V4 (v9.9): egress trace, OFF by default (NG_EGRESS=1 turns it on).
+# Runs once, after a SETTLED round only (keep-confirm or confirmed switch),
+# so the trace reflects the node the group is actually going to stay on.
+# cloudflare cdn-cgi/trace returns KEY=value lines; we keep ip= and loc=.
+# -m 6 and no retry: a slow trace must never extend a settled round.
+# Diagnostic aid only - nothing gates on it.
+egress_trace(){
+  [ "$NG_EGRESS" = "1" ] || return 0
+  ET=$(curl -s -m 6 "$NG_TRACE_URL" 2>/dev/null)
+  EIP=$(printf '%s\n' "$ET" | grep -m1 '^ip=' | cut -d= -f2)
+  ELC=$(printf '%s\n' "$ET" | grep -m1 '^loc=' | cut -d= -f2)
+  if [ -n "$EIP" ]; then
+    log "  egress ip=${EIP} loc=${ELC:-unknown} (V4)"
+  else
+    log "  egress trace unreadable (V4 enabled, no ip= line)"
+  fi
+}
 
 SAVED_IFS=$IFS
 IFS='
 '
 : > "$RACE_RES"
 
-# 6a) measure current node first (already selected, zero switching)
-C_OK204=0; k=1
-while [ $k -le "$TRY204" ]; do
-  C1=$(curl -s -o /dev/null -w "%{http_code}" -m "$CAND_204_TMO" "https://www.gstatic.com/generate_204" 2>/dev/null)
-  [ "$C1" = "204" ] && C_OK204=$((C_OK204+1))
-  k=$((k+1))
-done
-CG=$(google_check)
-[ "$TERM_SIG" = "1" ] && exit 0       # F11: TERM checkpoint before the 12s measure
-CMED_STAB=$(speed_med)
-CMED=$(printf '%s\n' "$CMED_STAB" | cut -f1)
-CSTAB=$(printf '%s\n' "$CMED_STAB" | cut -f2)
+# 6a) measure current node - V7 (v9.10): REUSES the S3 samples instead of
+# re-probing. cur already ran 204 (R204), google (G) and one speed sample
+# (BEST_BPS) in SECTION 3, so re-firing all three here would be pure waste.
+# The cost: cur's 204 gate is now a single sample (R204=="204") instead of
+# the TRY204-of-TRY204 triple, and its median/throughput is the S3 value
+# (which F7 may have taken as the lower of two), not a fresh 2-try median.
+# Stability is unknown for cur (S3 measured once) so it is recorded as 100
+# (neutral: neither rewarded nor punished in the min/max ratio). This is a
+# deliberate accepted precision trade-off (see doc section 17).
+C_OK204=0
+[ "$R204" = "204" ] && C_OK204=$TRY204
+CG="$G"
+[ "$TERM_SIG" = "1" ] && exit 0       # F11: TERM checkpoint before the measure
+CMED=$BEST_BPS
+CSTAB=100
 CUR_LAT=$(printf '%s\n' "$TPS_ALL" | awk -F'\t' -v n="$CUR" '$2==n{print $1; exit}')
 # F20 (v9.6): cur missing from the pool must NOT cost it the latency vote.
 # cur already cleared the 204 and google gates this round, so it is a REAL
@@ -665,10 +1061,15 @@ if [ -z "$CUR_LAT" ]; then
 fi
 if [ "$C_OK204" -eq "$TRY204" ] && [ "$CG" != "2" ]; then
   printf '%s\t%s\t%s\t%s\n' "$CUR" "$CUR_LAT" "$CMED" "$CSTAB" >> "$RACE_RES"
+  commit_seat
   log "  cur [$CUR] ok204=${C_OK204}/${TRY204} google=$(google_word $CG) thr=${CMED}B/s stab=${CSTAB} lat=${CUR_LAT}ms"
 else
-  log "  cur [$CUR] failed gates (204=${C_OK204}/${TRY204} google=$(google_word $CG)), no seat"
+  # V2: name the gate that actually failed, so the log distinguishes a dead
+  # node (204) from a polluted exit (google) without reading the counters.
+  if [ "$C_OK204" -ne "$TRY204" ]; then CUR_CAUSE=G204_FAIL; else CUR_CAUSE=GOOGLE_POLLUTED; fi
+  log "  cur [$CUR] failed gates (204=${C_OK204}/${TRY204} google=$(google_word $CG)), no seat cause=$CUR_CAUSE"
 fi
+tlog 6a
 
 # 6b) finalists: jump, confirm, gate, measure
 RACE_LIST="$TOPS"
@@ -676,9 +1077,13 @@ for N in $RACE_LIST; do
   [ "$TERM_SIG" = "1" ] && break
   [ -z "$N" ] && continue
   [ "$N" = "$CUR" ] && continue
-  ACTUAL=$(put_node "$N")
+  put_node "$N"; ACTUAL="$PUT_RET"
   if [ "$ACTUAL" != "$N" ]; then
-    log "  cand [$N] switch rejected (actual [$ACTUAL]) skip"
+    if [ -z "$ACTUAL" ] || ! now_ok "$ACTUAL"; then
+      log "  cand [$N] switch rejected (unreadable actual [$ACTUAL]) skip cause=PUT_UNKNOWN"
+    else
+      log "  cand [$N] switch rejected (actual [$ACTUAL]) skip cause=PUT_REJECTED"
+    fi
     continue
   fi
   OK204=0; k=1
@@ -688,34 +1093,48 @@ for N in $RACE_LIST; do
     k=$((k+1))
   done
   if [ "$OK204" -lt "$TRY204" ]; then
-    log "  cand [$N] 204 only ${OK204}/${TRY204}, skip"
+    log "  cand [$N] 204 only ${OK204}/${TRY204}, skip cause=G204_FAIL"
     continue
   fi
-  CG=$(google_check)
+  # V7 (v9.10): google (zero-download) and speed_med (the only download)
+  # launch in parallel - google never contests the tunnel bandwidth, so the
+  # median is unaffected. Ceiling max(6, 2*SPEED_MAX) instead of 6+2*SPEED_MAX.
+  CG_F=/tmp/ng9_cg.$$
+  MS_F=/tmp/ng9_ms.$$
+  ( google_check > "$CG_F" ) &
+  ( speed_med > "$MS_F" ) &
+  wait
+  CG=$(cat "$CG_F"); rm -f "$CG_F"
   if [ "$CG" = "2" ]; then
-    log "  cand [$N] google $(google_word $CG), skip"
+    rm -f "$MS_F"
+    log "  cand [$N] google $(google_word $CG), skip cause=GOOGLE_POLLUTED"
     continue
   fi
-  [ "$TERM_SIG" = "1" ] && break        # F11: TERM checkpoint before the 12s measure
-  MED_STAB=$(speed_med)
+  [ "$TERM_SIG" = "1" ] && break        # F11: TERM checkpoint before the measure
+  MED_STAB=$(cat "$MS_F"); rm -f "$MS_F"
   MED=$(printf '%s\n' "$MED_STAB" | cut -f1)
   STB=$(printf '%s\n' "$MED_STAB" | cut -f2)
   LAT=$(printf '%s\n' "$TPS_ALL" | awk -F'\t' -v n="$N" '$2==n{print $1; exit}')
   [ -z "$LAT" ] && LAT=999
   printf '%s\t%s\t%s\t%s\n' "$N" "$LAT" "$MED" "$STB" >> "$RACE_RES"
+  commit_seat
   log "  cand [$N] ok204=${OK204}/${TRY204} google=$(google_word $CG) thr=${MED}B/s stab=${STB} lat=${LAT}ms"
 done
 IFS=$SAVED_IFS
+tlog 6b
 
 # ============================================================
 # SECTION 7: stage-3 scoring (vs-best, rank-free) + gates + settle
 # ============================================================
 SEATS=$(grep -c . "$RACE_RES" 2>/dev/null)
 if [ -z "$SEATS" ] || [ "$SEATS" -lt 1 ]; then
-  # nobody seated: restore cur, log, retry race blocked by cooldown
-  RBF=$(put_node "$CUR")
+  # F23 (v9.8): nobody seated -> commit_seat never ran, so RACE_TS and
+  # RTS_LOG are still untouched by this round. No cooldown armed, no slot
+  # burned. FAIL_N is set to 1 to keep the mild counter honest (cur is
+  # still in the same state), and the next round races again at once.
+  put_node "$CUR"; RBF="$PUT_RET"
   LEDGER=$RBF
-  log "ERR race all failed (204/google/throughput dead), restored [$RBF], retry after cooldown"
+  log "ERR race seated nobody (all 204/google/throughput gates failed), restored [$RBF]; no slot, no cooldown (F23) - next round may retry cause=ALL_DEAD"
   save_state 1 "$NOW"
   SW_DONE=1
   exit 0
@@ -769,7 +1188,7 @@ KEEP=0
 [ "$BEST_NODE" = "$CUR" ] && KEEP=1
 [ "$MARGIN" != "1" ] && KEEP=1
 if [ "$KEEP" = "1" ]; then
-  CONFIRMED=$(put_node "$CUR")
+  put_node "$CUR"; CONFIRMED="$PUT_RET"
   LEDGER=$CONFIRMED
   if [ "$BEST_NODE" = "$CUR" ]; then
     log "OK race winner still [$CUR] ($BEST_SCORE), kept"
@@ -784,28 +1203,30 @@ if [ "$KEEP" = "1" ]; then
     log "OK margin ${MARGIN_PCT}% under TIE_PCT=${TIE_PCT}, keep [$CUR]"
   fi
   if [ "$CONFIRMED" = "$CUR" ]; then
+    egress_trace
     save_state 0 "$NOW"; SW_DONE=1
     exit 0
   fi
   if [ "$BEST_NODE" = "$CUR" ]; then
-    log "ERR cannot restore [$CUR] (actual [$CONFIRMED]), manual check next round"
+    log "ERR cannot restore [$CUR] (actual [$CONFIRMED]), manual check next round cause=KEEP_REJECTED"
     save_state 1 "$NOW"; SW_DONE=1
     exit 0
   fi
-  log "WARN keep-restore rejected (actual [$CONFIRMED]), fall through to switch [$BEST_NODE]"
+  log "WARN keep-restore rejected (actual [$CONFIRMED]), fall through to switch [$BEST_NODE] cause=KEEP_REJECTED"
 fi
 
-CON=$(put_node "$BEST_NODE")
+put_node "$BEST_NODE"; CON="$PUT_RET"
 LEDGER=$CON
 SW_DONE=1
 if [ "$CON" != "$BEST_NODE" ]; then
-  RBF=$(put_node "$CUR")
+  put_node "$CUR"; RBF="$PUT_RET"
   LEDGER=$RBF
-  log "ERR switch to [$BEST_NODE] ineffective (actual [$CON]), rolled back [$RBF]"
+  log "ERR switch to [$BEST_NODE] ineffective (actual [$CON]), rolled back [$RBF] cause=SWITCH_ROLLBACK"
   save_state 1 "$NOW"
   exit 0
 fi
 log "ACT switch [$CUR] -> [$BEST_NODE] score ${CUR_SCORE}->${BEST_SCORE} [confirmed]"
+egress_trace
 
 rm -f "$RACE_RES" "$SCORED"
 save_state 0 "$NOW"

@@ -1,13 +1,104 @@
 #!/bin/sh
 # ============================================================
+# nodeguard.sh v9.12 - common-vote margin + honest ceilings
+# Base: v9.11 (1487 lines). All v9.11 fixes (F24/F25/F26/F27) retained.
+# v9.12 changes (bug fixes, NOT additive):
+#  F28 common-vote margin. v9.11's score used a PER-ROW denominator: a row
+#     with jit=-1 (the NO-DATA marker) dropped the jitter term from its own
+#     numerator AND denominator, so rows with different data availability were
+#     compared on DIFFERENT vote sets. Two concrete damages, both verified in
+#     the sandbox:
+#      dmg1: jitter-only weights + cur carrying jit=-1: cur scored the -1.0
+#            sentinel, the single candidate scored 100.0, MARGIN fired on a
+#            sentinel-vs-real comparison and the round switched cur off for
+#            having NO DATA (repro: repro_nometric_mixed.sh).
+#      dmg2: default weights: cur (always jit=-1, one S3 sample) is scored on
+#            105/115th of the vote mass a full-data candidate enjoys, so a
+#            candidate collects up to ~13pp of "participation bonus". A
+#            jit=200ms candidate still beat cur on an otherwise tied pool
+#            (defect_scan.sh S4: 99.7 vs 96.4), silently loosening TIE_PCT=20
+#            down to an effective threshold of a few percent.
+#     The fix: the score awk now emits a SECOND column, score3 = the weighted
+#     score on the lat/thr/stab votes ONLY (all three are always live: every
+#     seated row has a real latency, a real median, a real stability rating).
+#     The BEST-vs-CUR margin test then compares on the COMMON vote set:
+#       - cur jit >= 0 and BEST jit >= 0: compare the FULL scores (jitter
+#         included) - both rows have the data, the vote is honest;
+#       - otherwise: compare score3 for both (and if BEST carries no jitter
+#         data but some OTHER row did, that other row is not in a margin pair
+#         against cur anyway - only BEST is).
+#     Sort/DECIDE/best-row selection keeps using the FULL per-row score: a
+#     jitter-rich candidate still legitimately outranks a jitter-less twin
+#     for the winner PICK; what changed is only the KEEP-vs-SWITCH margin
+#     arithmetic for the node cur actually is.
+#     If even score3 is unavailable (all four weights zero is already forced
+#     to defaults by the existing guard, so this needs W_LAT=W_THR=W_STAB=0
+#     with only W_JIT live AND no jitter data anywhere - the F27 world), the
+#     existing NO_METRIC branch keeps cur (unchanged).
+#  F29 JIT_NEUTRAL WARN. The knob was removed in v9.11 (the -1 marker replaced
+#     it) but a stale conf line was IGNORED silently, which reads as "the knob
+#     still works" to an operator who never read the changelog. One log line
+#     per round when the deprecated key is present. Log layer only.
+#  F30 serial /proxies refetch removed (ceiling 94s -> 84s). S5 fires three
+#     GETs in parallel and writes the /proxies group set to GRP_F; the old
+#     code then refetched $API/proxies SERIALLY (-m10) into the SAME variable,
+#     so the parallel result was never used and the serial fetch owned up to
+#     10s of the ceiling by itself. v9.10's parallelisation was thus only
+#     2/3 effective on paper. Both fetches returned the same bytes (same
+#     read-only GET, no side effects), so dropping the serial one loses
+#     nothing. Also: the SCREEN_NORESP early exit now removes the S5 temp
+#     files (TYPE_F/GRP_F/DLY_F already handled) so no /tmp leak remains.
+#  r1 note (housekeeping, no behaviour): the audit's "94s -> 84s" figure
+#     counts the dropped serial fetch as a pure -10s; the committed cost model
+#     (cost_v910.py) keeps PROXY_T inside the S5 parallel max(15,15,10)=15s,
+#     so its 94s was ALREADY leak-free and stays the derivation of record.
+#     The -10s the audit saw was only correct for the OBSERVED serialized
+#     execution (busybox waits do not preempt); on the router the two S5 curls
+#     overlap, so the real saving is small and the 84s figure is the safe
+#     documented bound, not a promise of 10s faster rounds.
+# ------------------------------------------------------------------------
+# nodeguard.sh v9.11 - intra-round loss/jitter scoring + capped-EMA baseline
+# Base: v9.10 (1233 lines; F24/F25/F26 port ideas from mihomo PR #2711 Smart)
+# v9.11 changes (additive to gates; score gains one dimension, baseline smarter):
+#  F24 loss column: every seated row records loss100 = the 204-miss share
+#     of its TRY204 probes (gate unchanged; with TRY204=3 a passing node has
+#     loss=0, the column generalises to TRY204=5 via conf where 4/5 seats
+#     with loss100=20). Ported spirit: mihomo's confidence gate - a node that
+#     fails the gate never seats, so no seated node is punished on thin data.
+#  F25 jitter column: the TRY204 probes now also record %{time_total}; the
+#     span (max-min, ms, integer) goes into the score. Lower is better;
+#     sc_jit = (bestjit+1)/(jit+1)*100 (the +1 keeps a legitimate 0ms span
+#     from zeroing the whole vote). A row with NO measurable span carries the
+#     marker jitter=-1 and is excluded from the jitter vote entirely (term
+#     dropped from numerator AND denominator) - never rewarded, never punished.
+#     W_JIT (default 15) joins the weighted sum; W_JIT=0 restores v9.10's
+#     ranking for seats whose other columns are unchanged.
+#  F26 capped-EMA PREV_BPS: v9.10 overwrote the spike baseline with the newest
+#     sample, so a one-off burst (speedtest next door) raised next round's
+#     bar by up to 300 percent and manufactured fake "spikes". Now the EMA
+#     moves slowly: new = (old*EMA_A + capped*(100-EMA_A))/100 where capped is
+#     old*EMA_CAP% on the way UP only; samples > old*EMA_SPIKE% are SPIKES and
+#     do not touch the baseline at all (logged). PREV_BPS=0 seeds directly.
+#     A confirmed switch to a different node zeroes the baseline (re-seed next
+#     round), so old-node history can never pin a fast new node in spike jail.
+#     v9.10 behaviour (plain overwrite) is available via EMA_A=0 EMA_CAP=10000
+#     EMA_SPIKE=1000000 (and is then bit-identical on the keep path).
+#  NOT shipped (deliberate): dual-source 204 probing, cross-round per-node
+#     loss windows, SpeedObserver passive speed (blocked by the 4-line state
+#     rule / no-daemon architecture; see design doc).
+# ------------------------------------------------------------------------
 # nodeguard.sh v9.10 - racing ceiling trim to <=100s (scheme B, accepted precision loss)
+#     v9.11 keeps the 94s ceiling; v9.12 lowers it to 84s (F30, see below).
 # Base: v9.9 (V1-V6; 1209 lines at v9.10 edit start)
 # v9.10 changes (NOT additive: user accepted semantic changes, but the
 # architectural constraints stay - single-file sh + cron no daemon, 4-line
 # state, ASCII-only comments, 100% verifiable answers, no cloud deploy/push):
 #  V7 per-phase timing, OFF by default. NG_TIMING=1 logs a cumulative
 #     wall-clock line "t:<phase>=<Ns>" for S2/S3/S5/6a/6b (T0 set in SECTION 1).
-#  B-racecost ceiling cut from v9.9's 281s to 94s (scheme B). Precision loss:
+#  B-racecost ceiling cut from v9.9's 281s to 94s (scheme B), then to 84s in
+#     v9.12 (F30: the serial /proxies refetch removed; the parallel S5 block
+#     already produces that file, and a redundant serial -m10 fetch alone was
+#     worth 10s of the old 94s bound). Precision loss (v9.10, retained):
 #      B1 SPEED_TRIES 3->2 (2 samples = mean, no true median)
 #      B2 TOP_PICK    3->2 (comparison pool shrinks)
 #      B3 group delay -m30->-m15 (slow groups may screen SCREEN_NORESP)
@@ -18,7 +109,7 @@
 #      S3 google/204/speed three probes parallel
 #      S5 delay + providers + proxies three requests parallel
 #      6b google + speed_med parallel per candidate
-#     v9.9's 281s bound below is kept AS HISTORY; v9.10 upper bound = 94s.
+#     v9.9's 281s bound below is kept AS HISTORY; the current upper bound is 84s.
 # ------------------------------------------------------------------------
 # v9.9 changes (the file below this block is the v9.9 changelog, retained as
 #   history; v9.10 supersedes the ceiling figure, NOT the behavioural notes):
@@ -59,6 +150,7 @@
 #       SCREEN_EMPTY SCREEN_SMALL BUDGET COOLDOWN_MILD SPIKE_WAIT
 #       MILD_WINDOW G204_FAIL GOOGLE_POLLUTED PUT_REJECTED PUT_UNKNOWN
 #       ALL_DEAD RESTORE_FAIL KEEP_REJECTED SWITCH_ROLLBACK
+#       NO_METRIC (F27, v9.11 r1) NO_COMMON_METRIC (F28, v9.12)
 #     Log layer only; no judgement logic changed.
 #  V3 read-only self-check. "NG_CHECK=1" env or a bare "--check" argv
 #     runs a pre-lock, pre-write check: API reachability, group type,
@@ -282,7 +374,7 @@
 #     is 281s (4.7min), still > 4min, so the 8min threshold still holds
 #     with 199s of margin even if every single probe times out fully
 #     (upper bound, not a duration).
-#     (v9.10 supersedes: ceiling now 94s -> margin 386s; see header block.)
+#     (v9.10 supersedes, v9.12 F30 lowers: ceiling now 84s -> margin 396s; see header block.)
 #     8min sacrifices at most 1 round on a really stuck lock instead.
 #  S2 EXT path stops polluting the baseline: on external change the
 #     old code fell through to the PREV_BPS persist line and overwrote it
@@ -320,7 +412,7 @@ SEL="$NG_GROUP_SEL"
 # V6 (v9.9): single version constant - the per-round log prints this.
 # (v9.6 F14 shipped logging "v9.3": a literal at the log site is how
 # that happens. The mihomo version keeps its own name NG_VER.)
-NG_VERSION=v9.10
+NG_VERSION=v9.12
 
 # v9 tunables (override in conf)
 WIN_SEC=${WIN_SEC:-900}          # mild-anomaly window: 2 hits inside window
@@ -335,12 +427,100 @@ SEVERE_BPS=${SEVERE_BPS:-15360}  # severe line 15KB/s
 SPEED_MAX=${SPEED_MAX:-4}        # single throughput try cap seconds
 SPEED_TRIES=${SPEED_TRIES:-2}    # throughput tries per candidate (median) (v9.10: 3->2)
 TRY204=${TRY204:-3}              # 204 probes per candidate (success gate)
+# v9.11: TRY204 became a DIVISOR (the LOSS share at the probe loop). A conf
+# typo of TRY204=0 used to be harmless in v9.10 (only compared, never divided);
+# now it would abort the whole round with "divide by zero" mid-race, which is
+# strictly worse than a bad gate. Clamp it to >=1: one probe is the smallest
+# meaningful gate and the loop/gate/score all stay well defined.
+case "$TRY204" in ''|*[!0-9]*) TRY204=3 ;; esac
+[ "$TRY204" -lt 1 ] && TRY204=1
+# F24 (v9.11): how many 204 misses a seat may absorb. 0 = v9.10's all-204 rule
+# (bit-identical default); raise to 1..TRY204-1 to let a near-clean node seat
+# with a non-zero LOSS share recorded (mihomo confidence spirit).
+LOSS_MAX=${LOSS_MAX:-0}
+case "$LOSS_MAX" in ''|*[!0-9]*) LOSS_MAX=0 ;; esac
+[ "$LOSS_MAX" -ge "$TRY204" ] && LOSS_MAX=$(( TRY204 - 1 ))
+[ "$LOSS_MAX" -lt 0 ] && LOSS_MAX=0
 CAND_204_TMO=${CAND_204_TMO:-2}
 SPIKE_PCT=${SPIKE_PCT:-20}       # thr drop pct vs last round to flag spike
 W_LAT=${W_LAT:-30}               # lat weight
 W_THR=${W_THR:-60}               # throughput weight
 W_STAB=${W_STAB:-10}             # stability weight
+# F25 (v9.11): jitter weight. 0 reproduces v9.10's ranking exactly (the only
+# score change is this term); 15 default keeps lat+thr dominant.
+W_JIT=${W_JIT:-15}               # jitter weight (v9.11)
+# v9.11: all four weights are now DIVISORS of the weighted sum, so a conf with
+# every weight at 0 (or a typo that makes one non-numeric) would abort the
+# score awk with "Division by zero" and leave SCORED empty - after which
+# BEST_NODE is empty and the round tries to "switch" to nothing. Numeric guard
+# first, then an all-zero fallback to the shipped defaults.
+case "$W_LAT"  in ''|*[!0-9]*) W_LAT=30  ;; esac
+case "$W_THR"  in ''|*[!0-9]*) W_THR=60  ;; esac
+case "$W_STAB" in ''|*[!0-9]*) W_STAB=10 ;; esac
+case "$W_JIT"  in ''|*[!0-9]*) W_JIT=15  ;; esac
+if [ $(( W_LAT + W_THR + W_STAB + W_JIT )) -eq 0 ]; then
+  W_LAT=30; W_THR=60; W_STAB=10; W_JIT=15
+fi
+# F26 (v9.11): capped-EMA constants for the PREV_BPS baseline
+EMA_A=${EMA_A:-80}               # old-sample weight in percent (0.8 -> 80)
+EMA_CAP=${EMA_CAP:-125}          # up-step cap in percent (1.25 -> 125)
+EMA_SPIKE=${EMA_SPIKE:-300}      # sample above old*this%% is a spike, ignored
+# v9.11: EMA_A doubles as a WEIGHT, so a value above 100 makes the blend
+# extrapolate backwards - the new sample gets a NEGATIVE weight and a fast node
+# would push the baseline DOWN, manufacturing a fake spike next round. Clamp to
+# the meaningful range 0..100 (non-numeric values are re-guarded at the use site
+# too, so an old conf with garbage still degrades to the default).
+case "$EMA_A" in ''|*[!0-9]*) EMA_A=80 ;; esac
+[ "$EMA_A" -gt 100 ] && EMA_A=100
+# v9.11 r1: EMA_CAP is an UP-ONLY cap, so a value below 100 silently turns it
+# into a DOWN step. Worked example (verified in the sandbox): PREV=30000 and a
+# sample EQUAL to the baseline, EMA_CAP=50 -> CAP_LIM=15000, SAMPLE clipped to
+# 15000, new baseline 27000. A flat node would then look 10 percent slower next
+# round, i.e. the cap manufactures the very spike it was meant to suppress.
+# Clamp to >=100 (100 lets a slower sample HOLD the baseline, never lift it;
+# the shipped default 125 is untouched). EMA_SPIKE below 100 classes every
+# ordinary sample as a spike and freezes the baseline forever, so it gets the
+# same floor.
+case "$EMA_CAP"   in ''|*[!0-9]*) EMA_CAP=125   ;; esac
+[ "$EMA_CAP" -lt 100 ] && EMA_CAP=100
+case "$EMA_SPIKE" in ''|*[!0-9]*) EMA_SPIKE=300 ;; esac
+[ "$EMA_SPIKE" -lt 100 ] && EMA_SPIKE=100
+# v9.11 r1: the remaining numeric knobs were guarded only implicitly (a
+# non-numeric value makes [ -lt ] fail silently). That is mostly harmless, but
+# four of them stop the round doing any real work while looking healthy:
+# SPEED_TRIES or SPEED_MAX non-numeric/0 -> speed_med loops zero times -> every
+# throughput reads 0; TOP_PICK non-numeric -> "head -2x" errors -> no finalist
+# is ever raced; CAND_204_TMO 0 -> every probe times out instantly. Coerce to
+# the shipped default first, then apply the floor. Values that legitimately
+# mean "switch this off" (RACE_BUDGET_H=0, FAIL_TRIGGER=0, TIE_PCT=0,
+# THRESH_BPS=0) are deliberately left alone.
+case "$WIN_SEC"        in ''|*[!0-9]*) WIN_SEC=900      ;; esac
+case "$FAIL_TRIGGER"   in ''|*[!0-9]*) FAIL_TRIGGER=2   ;; esac
+case "$RACE_CD"        in ''|*[!0-9]*) RACE_CD=900      ;; esac
+case "$RACE_BUDGET_H"  in ''|*[!0-9]*) RACE_BUDGET_H=2  ;; esac
+case "$RACE_BUDGET_WIN" in ''|*[!0-9]*) RACE_BUDGET_WIN=3600 ;; esac
+case "$TOP_PICK"       in ''|*[!0-9]*) TOP_PICK=2       ;; esac
+case "$TIE_PCT"        in ''|*[!0-9]*) TIE_PCT=20       ;; esac
+case "$THRESH_BPS"     in ''|*[!0-9]*) THRESH_BPS=30720 ;; esac
+case "$SEVERE_BPS"     in ''|*[!0-9]*) SEVERE_BPS=15360 ;; esac
+case "$SPEED_MAX"      in ''|*[!0-9]*) SPEED_MAX=4      ;; esac
+case "$SPEED_TRIES"    in ''|*[!0-9]*) SPEED_TRIES=2    ;; esac
+case "$CAND_204_TMO"   in ''|*[!0-9]*) CAND_204_TMO=2   ;; esac
+case "$SPIKE_PCT"      in ''|*[!0-9]*) SPIKE_PCT=20     ;; esac
+[ "$TOP_PICK" -lt 1 ]    && TOP_PICK=1
+[ "$SPEED_TRIES" -lt 1 ] && SPEED_TRIES=1
+[ "$SPEED_MAX" -lt 1 ]   && SPEED_MAX=1
+[ "$CAND_204_TMO" -lt 1 ] && CAND_204_TMO=1
 SPEED_URL="${SPEED_URL:-https://i.ytimg.com/vi/aqz-KE-bpKQ/maxresdefault.jpg}"
+# F25 (v9.11): any row with no measurable probe span (cur, which gets a single
+# S3 204 sample; or a candidate whose probes returned no time_total) is written
+# as jitter=-1, the NO DATA marker. The score awk then removes the jitter term
+# from BOTH numerator and denominator for that row. A small fixed "neutral"
+# number cannot do that job: any span near 0 scores ~100 against a real span,
+# so the row would be REWARDED for having no data. There is deliberately no
+# JIT_NEUTRAL knob any more - the -1 marker replaced it; an old conf that
+# still sets JIT_NEUTRAL is ignored (v9.12 F29: and now WARNed about once per
+# round, so a stale conf reads as stale instead of silently doing nothing).
 PROV_TYPES="${PROV_TYPES:-AnyTLS|Hysteria2|Hysteria|Trojan|Vless|Vmess|Shadowsocks|ShadowsocksR|Socks5|Http|Ssh|Tuic|WireGuard|Mieru|Snell|Sudoku|Masque|TrustTunnel|ShadowQuic|OpenVPN|Tailscale|ZeroTier|EasyTier|GostRelay}"
 DRY_RUN=${NG_DRY_RUN:-0}
 # V4 (v9.9): egress trace, OFF by default. NG_EGRESS=1 logs one trace
@@ -360,6 +540,13 @@ LOG="${NG_LOG:-/root/nodeguard.log}"
 LOCK_DIR="${NG_LOCK:-/tmp/nodeguard_v9.lock}"   # F12: sandboxable lock (default unchanged)
 OFFFILE="${NG_OFF:-/root/.nodeguard.off}"   # F10: sandboxable
 log(){ echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG"; }
+# F29 (v9.12): one WARN per round if the conf still carries the
+# removed JIT_NEUTRAL key (parsed earlier, up in the conf section).
+# Sits here, AFTER log() - a POSIX sh function must be defined
+# before its first call or the WARN would die with log: not found.
+if [ -n "${JIT_NEUTRAL:-}" ]; then
+  log "WARN conf key JIT_NEUTRAL=[${JIT_NEUTRAL}] is deprecated (removed in v9.11: the jitter column uses the -1 NO-DATA marker) and is ignored (F29)"
+fi
 # V7 (v9.10): per-phase race timing. NG_TIMING=1 logs the cumulative wall
 # clock at each racing phase boundary as "t:phase=Ns" (seconds since T0,
 # which is set at SECTION 1). Default OFF: healthy rounds and timing-off
@@ -537,8 +724,8 @@ if [ "$NG_CHECK" = "1" ]; then
   echo "check_fail_counter=$CFAIL/${FAIL_TRIGGER}"
   # -- static cost model, derived from this file's own -m constants --
   echo "check_ceiling_healthy_s=$((5+5+5+6+5+4+4))"
-  echo "check_ceiling_racing_s=94 (v9.10 scheme-B all-timeout upper bound; see cost_v910.py)"
-  echo "check_lock_threshold=480s margin_vs_94s=$((480-94))s"
+  echo "check_ceiling_racing_s=84 (v9.12: F30 dropped the serial /proxies refetch; parallel S5 already produced that data)"
+  echo "check_lock_threshold=480s margin_vs_84s=$((480-84))s"
   # -- optional deep probe: ONE raw group-delay call --
   if [ "${NG_CHECK_DEEP:-0}" = "1" ]; then
     CDJ=$(curl -s -m 30 -H "$AH" "$API/group/$(enc "$SEL")/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=3000" 2>/dev/null)
@@ -564,8 +751,8 @@ fi
 # reproducible (mutually exclusive paths added); the v9.9-corrected
 # racing ceiling was 281s (4.7min), still > 4min, so 8min remained
 # correct with 199s of margin. v9.10 (scheme B) trims the all-timeout
-# ceiling to 94s (see header + cost_v910.py), margin 480-94=386s, so
-# 8min holds with far more headroom.
+# ceiling to 94s (cost_v910.py), v9.12 F30 to 84s; margin 480-84=396s,
+# so 8min holds with far more headroom.
 # S3: stale cleanup must run EVEN when mkdir fails. Old code exited on
 # mkdir failure (old v9.3 exited here), so a stale lock (left by a crashed round) made
 # every later round "SKIP another instance" forever, and the -mmin +8
@@ -723,8 +910,31 @@ if [ "$PREV_BPS" -gt 0 ] && [ "$BEST_BPS" -gt 0 ]; then
   fi
 fi
 if [ "$RACE_TS" -gt 0 ] && [ $((NOW-RACE_TS)) -lt "$RACE_CD" ]; then REM=$((RACE_CD-(NOW-RACE_TS))); else REM=0; fi
-# F8: persist this round's observed bps as PREV_BPS for next round
-[ "$BEST_BPS" -gt 0 ] 2>/dev/null && PREV_BPS=$BEST_BPS
+# F8/F26 (v9.11): persist this round's observed bps as PREV_BPS for next
+# round, via a capped EMA instead of v9.10's hard overwrite. A one-off burst
+# can now lift the baseline by at most EMA_CAP% (default +25%) instead of
+# 300%; samples beyond EMA_SPIKE% of the baseline (default 3x) are treated as
+# spikes and do not touch it at all. Integer math only; case $EMA_* guards
+# against garbage conf values. v9.10 behaviour (plain overwrite) is available
+# by setting EMA_A=0 EMA_CAP=10000 EMA_SPIKE=1000000.
+if [ "$BEST_BPS" -gt 0 ] 2>/dev/null; then
+  if [ "$PREV_BPS" -gt 0 ] 2>/dev/null; then
+    case "$EMA_A"    in ''|*[!0-9]*) EMA_A=80 ;; esac
+    case "$EMA_CAP"  in ''|*[!0-9]*) EMA_CAP=125 ;; esac
+    case "$EMA_SPIKE" in ''|*[!0-9]*) EMA_SPIKE=300 ;; esac
+    SPK_LIM=$(( PREV_BPS * EMA_SPIKE / 100 ))
+    if [ "$BEST_BPS" -gt "$SPK_LIM" ]; then
+      log "  F26 spike ignored: sample ${BEST_BPS}B/s > ${EMA_SPIKE}% of baseline ${PREV_BPS}B/s, baseline kept"
+    else
+      CAP_LIM=$(( PREV_BPS * EMA_CAP / 100 ))
+      SAMPLE=$BEST_BPS
+      [ "$SAMPLE" -gt "$CAP_LIM" ] && { SAMPLE=$CAP_LIM; }
+      PREV_BPS=$(( (PREV_BPS * EMA_A + SAMPLE * (100 - EMA_A)) / 100 ))
+    fi
+  else
+    PREV_BPS=$BEST_BPS
+  fi
+fi
 log "OK [$CUR] google=$GW 204=$R204 bps=$BEST_BPS fail=${FAIL_N}/${FAIL_TRIGGER} rcd=${REM}s spike=${SPIKE_FLAG}"
 tlog S3
 
@@ -825,7 +1035,12 @@ curl -s -m 10 -H "$AH" "$API/proxies" 2>/dev/null \
   | sort -u > "$GRP_F" &
 wait
 DELAY_JSON=$(cat "$DLY_F"); rm -f "$DLY_F"
-[ -z "$DELAY_JSON" ] && { log "ERR screen no response, keep [$CUR] cause=SCREEN_NORESP"; save_state "$FAIL_N" "$NOW"; exit 0; }
+if [ -z "$DELAY_JSON" ]; then
+  # F30: this early exit runs between the parallel launch and the cleanup, so
+  # the other two S5 temp files (TYPE_F, GRP_F) would leak in /tmp for a day.
+  rm -f "$TYPE_F" "$GRP_F"; TYPE_F=""; GRP_F=""
+  log "ERR screen no response, keep [$CUR] cause=SCREEN_NORESP"; save_state "$FAIL_N" "$NOW"; exit 0
+fi
 
 # parse layer 0: last-colon split (v8 rules)
 # layer 1: keyword junk filter (v8 rules, kept as defense in depth:
@@ -839,16 +1054,17 @@ TPS_ALL=$(echo "$DELAY_JSON" | sed 's/^[{]*//; s/[}]*$//; s/"//g' | tr ',' '\n' 
             -e '官网' -e '剩余' -e '重置' -e '到期' -e '套餐' -e '：' \
             -e '倍率' -e '勿跑' -e '过期' -e '失联' )
 
-# F5: subtract the authoritative GROUP set parsed from /proxies.
-# Verified live: /proxies returns ONLY groups + builtins (32 entries),
-# never provider nodes, because provider nodes do not register in
-# tunnel.Proxies(). So this subtraction is exact and survives the
-# providers-API-down degraded path, where the keyword blacklist alone
-# would happily keep "🇭🇰 香港节点" and then put_node it (legal, but a
-# nested delegation instead of a real node).
-curl -s -m 10 -H "$AH" "$API/proxies" 2>/dev/null \
-  | tr '{' '\n' | grep -o '"name":"[^"]*"' | sed 's/^"name":"//; s/"$//' \
-  | sort -u > "$GRP_F"
+# F30 (v9.12): the authoritative GROUP set is the one the PARALLEL $API/proxies
+# fetch above already wrote to GRP_F. v9.11 refetched it serially (-m10) right
+# here, into the same variable, so the parallel result was never used: a pure
+# waste of up to 10s per race round (on the router the two curls overlap, but
+# the busybox-w32 sandbox serialises them, which is how the waste survived the
+# v9.10 sandbox A/B unnoticed). Verified live: /proxies returns ONLY groups +
+# builtins (32 entries), never provider nodes, because provider nodes do not
+# register in tunnel.Proxies(). So this subtraction is exact and survives the
+# providers-API-down degraded path, where the keyword blacklist alone would
+# happily keep "HK Hong Kong node" and then put_node it (legal, but a nested
+# delegation instead of a real node).
 GRP_N=$(grep -c . "$GRP_F" 2>/dev/null)
 if [ "${GRP_N:-0}" -gt 0 ] 2>/dev/null; then
   TPS_G=$(printf '%s\n' "$TPS_ALL" | awk -F'\t' 'NR==FNR{g[$0]=1;next} NF>1 && !($2 in g)' "$GRP_F" -)
@@ -1042,6 +1258,19 @@ CG="$G"
 [ "$TERM_SIG" = "1" ] && exit 0       # F11: TERM checkpoint before the measure
 CMED=$BEST_BPS
 CSTAB=100
+# F24/F25 (v9.11): cur gets a single S3 204 sample, so its jitter span is NOT
+# observable and is written as the NO-DATA marker -1; the score awk then drops
+# the jitter term (from numerator AND denominator) for that row. That is true
+# neutrality: a small fixed "neutral" value could not deliver it, because any
+# number near 0 scores ~100 against a real span and would silently REWARD cur.
+# The SAME -1 marker is used for a candidate whose probes return no time_total
+# (see the probe loop).
+# LOSS is different: it is an UNWEIGHTED column (weighting it would be
+# weighting a constant - the gate already zeroes it for every seated row), and
+# cur did clear its 204 sample, so 0 is its true recorded value. Only the
+# jitter column carries -1 here (r1 fix: this comment used to claim both).
+CLOSS=0
+CJIT=-1
 CUR_LAT=$(printf '%s\n' "$TPS_ALL" | awk -F'\t' -v n="$CUR" '$2==n{print $1; exit}')
 # F20 (v9.6): cur missing from the pool must NOT cost it the latency vote.
 # cur already cleared the 204 and google gates this round, so it is a REAL
@@ -1060,9 +1289,9 @@ if [ -z "$CUR_LAT" ]; then
   log "  cur [$CUR] not in delay pool, lat estimated at pool median ${CUR_LAT}ms (F20)"
 fi
 if [ "$C_OK204" -eq "$TRY204" ] && [ "$CG" != "2" ]; then
-  printf '%s\t%s\t%s\t%s\n' "$CUR" "$CUR_LAT" "$CMED" "$CSTAB" >> "$RACE_RES"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$CUR" "$CUR_LAT" "$CMED" "$CSTAB" "$CLOSS" "$CJIT" >> "$RACE_RES"
   commit_seat
-  log "  cur [$CUR] ok204=${C_OK204}/${TRY204} google=$(google_word $CG) thr=${CMED}B/s stab=${CSTAB} lat=${CUR_LAT}ms"
+  log "  cur [$CUR] ok204=${C_OK204}/${TRY204} google=$(google_word $CG) thr=${CMED}B/s stab=${CSTAB} loss=${CLOSS} jit=${CJIT}ms lat=${CUR_LAT}ms"
 else
   # V2: name the gate that actually failed, so the log distinguishes a dead
   # node (204) from a polluted exit (google) without reading the counters.
@@ -1086,14 +1315,59 @@ for N in $RACE_LIST; do
     fi
     continue
   fi
-  OK204=0; k=1
+  # F24/F25 (v9.11): the 204 gate loop now also captures %{time_total} per
+  # probe. OK204 keeps its gate role (unchanged); NEWL is the loss share the
+  # seat records, and TT_MIN/TT_MAX track the time span for the jitter
+  # column. The curl is the SAME request as v9.10 (one -w field added), so
+  # ceiling and traffic cost are unchanged.
+  OK204=0; k=1; TT_MIN=""; TT_MAX=""
   while [ $k -le "$TRY204" ]; do
-    C1=$(curl -s -o /dev/null -w "%{http_code}" -m "$CAND_204_TMO" "https://www.gstatic.com/generate_204" 2>/dev/null)
-    [ "$C1" = "204" ] && OK204=$((OK204+1))
+    C1=$(curl -s -o /dev/null -w "%{http_code} %{time_total}" -m "$CAND_204_TMO" "https://www.gstatic.com/generate_204" 2>/dev/null)
+    C1_CODE=$(printf '%s' "$C1" | cut -d' ' -f1)
+    C1_TT=$(printf '%s' "$C1" | cut -d' ' -f2)
+    [ "$C1_CODE" = "204" ] && OK204=$((OK204+1))
+    # v9.11 r1: the old test only checked the CHARACTER SET, so a malformed
+    # value such as "1.2.3", "12.34.56", "." or ".." passed and awk then took
+    # its numeric PREFIX ("1.2.3" -> 1200ms, ".." -> 0ms). A corrupt sample was
+    # therefore used silently instead of dropped, and could widen or collapse
+    # the span the jitter vote is built on. Reject more than one dot, and a
+    # leading or trailing dot, on top of the character-set filter.
+    case "$C1_TT" in
+      ''|*[!0-9.]*|.*|*.|*.*.*) : ;;
+      *)
+        # integer ms; leading 0s preserved by printf %.0f-free math
+        C1_MS=$(printf '%s' "$C1_TT" | awk '{printf "%d", $1*1000}')
+        [ -z "$TT_MIN" ] && TT_MIN=$C1_MS
+        [ -z "$TT_MAX" ] && TT_MAX=$C1_MS
+        [ "$C1_MS" -lt "$TT_MIN" ] && TT_MIN=$C1_MS
+        [ "$C1_MS" -gt "$TT_MAX" ] && TT_MAX=$C1_MS
+        ;;
+    esac
     k=$((k+1))
   done
-  if [ "$OK204" -lt "$TRY204" ]; then
-    log "  cand [$N] 204 only ${OK204}/${TRY204}, skip cause=G204_FAIL"
+  # F24: loss share of the seat, integer 0-100.
+  # The gate is OK204 >= TRY204-LOSS_MAX. LOSS_MAX defaults to 0, which makes
+  # that gate identical to v9.10's all-204 requirement, so LOSS is a constant 0
+  # unless the operator raises LOSS_MAX in conf. That is deliberate: the column
+  # is the hook mihomo's confidence idea needs, but the DEFAULT behaviour must
+  # stay bit-identical to v9.10 (no silent loosening of the 204 gate).
+  # e.g. TRY204=5 LOSS_MAX=1 lets 4/5 seat and records LOSS=20.
+  LOSS=$(( (TRY204 - OK204) * 100 / TRY204 ))
+  # F25: jitter = ms span of the probe times.
+  # NO-DATA must be the SAME marker cur uses (-1), not a small "neutral"
+  # number. A fixed 5ms would score (bestjit+1)*100/6 = ~350 -> capped 100
+  # against any real 20ms span, i.e. a node that produced NO timing data at
+  # all would win the jitter vote outright. Reachable whenever the loss gate
+  # is opened (LOSS_MAX>0) and every probe still failed to report time_total.
+  # -1 makes the score awk drop the jitter term from numerator AND denominator,
+  # which is the only honest treatment: no data, no vote.
+  if [ -n "$TT_MIN" ] && [ -n "$TT_MAX" ]; then
+    JITTER=$(( TT_MAX - TT_MIN ))
+  else
+    JITTER=-1
+  fi
+  if [ $(( TRY204 - OK204 )) -gt "$LOSS_MAX" ]; then
+    log "  cand [$N] 204 only ${OK204}/${TRY204} (loss ${LOSS}% > LOSS_MAX ${LOSS_MAX}%), skip cause=G204_FAIL"
     continue
   fi
   # V7 (v9.10): google (zero-download) and speed_med (the only download)
@@ -1116,9 +1390,9 @@ for N in $RACE_LIST; do
   STB=$(printf '%s\n' "$MED_STAB" | cut -f2)
   LAT=$(printf '%s\n' "$TPS_ALL" | awk -F'\t' -v n="$N" '$2==n{print $1; exit}')
   [ -z "$LAT" ] && LAT=999
-  printf '%s\t%s\t%s\t%s\n' "$N" "$LAT" "$MED" "$STB" >> "$RACE_RES"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$N" "$LAT" "$MED" "$STB" "$LOSS" "$JITTER" >> "$RACE_RES"
   commit_seat
-  log "  cand [$N] ok204=${OK204}/${TRY204} google=$(google_word $CG) thr=${MED}B/s stab=${STB} lat=${LAT}ms"
+  log "  cand [$N] ok204=${OK204}/${TRY204} google=$(google_word $CG) thr=${MED}B/s stab=${STB} loss=${LOSS} jit=${JITTER}ms lat=${LAT}ms"
 done
 IFS=$SAVED_IFS
 tlog 6b
@@ -1140,14 +1414,24 @@ if [ -z "$SEATS" ] || [ "$SEATS" -lt 1 ]; then
   exit 0
 fi
 
-# columns: name TAB lat TAB med TAB stab. N2: stability is real now
-# (min/max ratio of the 3 throughput samples, 0-100). W_STAB=0 in
-# conf disables its vote (ratio still recorded in the log table).
-awk -F'\t' -v wl="$W_LAT" -v wt="$W_THR" -v ws="$W_STAB" '
+# columns: name TAB lat TAB med TAB stab TAB loss TAB jitter. N2: stability
+# is real now (min/max ratio of the throughput samples, 0-100). F24/F25
+# (v9.11): loss is recorded per seat (always 0 while TRY204=3: the gate
+# passes all-204); jitter is the ms span of the 204 probes. The WEIGHTED
+# SUM uses lat/thr/stab/jit; loss stays a column only (in-pool value is
+# 0 by the gate, weighting it would be weighting a constant).
+# W_STAB=0 / W_JIT=0 in conf disables either vote (columns still logged).
+awk -F'\t' -v wl="$W_LAT" -v wt="$W_THR" -v ws="$W_STAB" -v wj="$W_JIT" '
+  BEGIN { nobest = 1; bestjit = 0 }
   NR==FNR {
     if (FNR==1 || $2+0 < bestlat+0) bestlat=$2+0
     if (FNR==1 || $3+0 > bestthr+0) bestthr=$3+0
     if (FNR==1 || $4+0 > beststab+0) beststab=$4+0
+    # jit < 0 is the NO-DATA marker (cur: one S3 sample; or a candidate whose
+    # probes reported no time_total). It must not become "the best span" - a -1
+    # baseline would drive (bestjit+1) to 0 and zero every candidate row too.
+    # Seed from the first REAL span only.
+    if ($6+0 >= 0 && (nobest == 1 || $6+0 < bestjit+0)) { bestjit=$6+0; nobest=0 }
     next
   }
   {
@@ -1163,26 +1447,127 @@ awk -F'\t' -v wl="$W_LAT" -v wt="$W_THR" -v ws="$W_STAB" '
     stab = $4+0
     sc_stab = (beststab <= 0) ? 0 : stab * 100 / beststab
     if (sc_stab > 100) sc_stab = 100
-    score = (wl*sc_lat + wt*sc_thr + ws*sc_stab) / (wl + wt + ws)
-    printf "%.1f\t%s\t%s\t%s\t%s\n", score, $1, $2, $3, stab
+    # F25: jitter = ms span of the 204 probes. Lower is better.
+    # Score is (bestjit+1)*100/(jit+1), NOT bestjit*100/(jit+1): with the
+    # latter a legitimate 0ms span would make bestjit=0 and every score 0,
+    # silently disabling the whole jitter vote.
+    # jit < 0 is the NO-DATA marker (cur: one S3 sample; or a candidate whose
+    # probes reported no time_total). Such a row drops the jitter term from
+    # BOTH numerator and denominator, which is the only way to be truly
+    # neutral - a small fixed "neutral" number would score ~100 against a real
+    # span and quietly REWARD that row.
+    jit = $6+0
+    if (jit < 0) {
+      sc_jit = 0
+      wj_e   = 0
+    } else {
+      sc_jit = (bestjit + 1) * 100 / (jit + 1)
+      if (sc_jit > 100) sc_jit = 100
+      wj_e   = wj
+    }
+    # F27 (v9.11 r1): a row can end up with NO live vote. With wl=wt=ws=0
+    # (jitter is the only enabled vote) a row carrying the -1 NO-DATA marker
+    # drops wj_e to 0, so the denominator reaches 0 and awk ABORTS the whole
+    # scoring pass with "Division by zero" - SCORED stays empty, BEST_NODE is
+    # empty and the round is left with no verdict at all. Verified in the
+    # sandbox (jitter-only weights + a jit=-1 row). -1 is a safe UNRANKABLE
+    # sentinel here because a real score is always >= 0 (every sc_* term and
+    # every weight is >= 0), so such a row simply sorts last.
+#     den = wl + wt + ws + wj_e
+#     if (den > 0) score = (wl*sc_lat + wt*sc_thr + ws*sc_stab + wj_e*sc_jit) / den
+#     else         score = -1
+# F28 (v9.12): also emit score3 = the same weighted sum over the votes that
+# are live for EVERY row regardless of data availability (lat/thr/stab all
+# are: every seated row really measured them). den3 = wl+wt+ws; if that is 0
+# (jitter-only conf) score3 is the -1 sentinel and the common-vote margin
+# degrades to the F27 NO_METRIC rule. Column order: score TAB name TAB lat
+# TAB med TAB stab TAB loss TAB jit TAB score3.
+    den = wl + wt + ws + wj_e
+    if (den > 0) score = (wl*sc_lat + wt*sc_thr + ws*sc_stab + wj_e*sc_jit) / den
+    else         score = -1
+    den3 = wl + wt + ws
+    if (den3 > 0) score3 = (wl*sc_lat + wt*sc_thr + ws*sc_stab) / den3
+    else         score3 = -1
+    printf "%.1f\t%s\t%s\t%s\t%s\t%s\t%s\t%.1f\n", score, $1, $2, $3, stab, $5, jit, score3
   }
 ' "$RACE_RES" "$RACE_RES" | sort -rn > "$SCORED"
 
-log "SCORE (score/name/lat/thr/stab):"
+# F28 (v9.12): the SCORE log loop now reads the 8th column too (score3).
+# busybox read folds the unterminated tail into the LAST variable, so
+# without the extra `s3` the score3 field would glue itself onto the jit
+# field and corrupt the "jit=Nms" prefix every text assertion greps for.
+log "SCORE (score/name/lat/thr/stab/loss/jit/score3):"
 TABC=$(printf '\t')
-while IFS="$TABC" read -r sc nm lt tb st; do
-  log "  $nm score=$sc lat=${lt}ms thr=${tb}B/s stab=${st}"
+while IFS="$TABC" read -r sc nm lt tb st ls jt s3; do
+  log "  $nm score=$sc lat=${lt}ms thr=${tb}B/s stab=${st} loss=${ls} jit=${jt}ms s3=$s3"
 done < "$SCORED"
 
 BEST_LINE=$(head -1 "$SCORED")
 BEST_SCORE=$(echo "$BEST_LINE" | cut -f1)
 BEST_NODE=$(echo "$BEST_LINE" | cut -f2)
+BEST_S3=$(echo "$BEST_LINE" | cut -f8)
 CUR_LINE=$(awk -F'\t' -v n="$CUR" '$2==n{print; exit}' "$SCORED")
 CUR_SCORE=$(echo "$CUR_LINE" | cut -f1)
+CUR_S3=$(echo "$CUR_LINE" | cut -f8)
 [ -z "$CUR_SCORE" ] && CUR_SCORE=0
-log "DECIDE best=[$BEST_NODE]($BEST_SCORE) cur=[$CUR]($CUR_SCORE)"
+# F27 (v9.11 r1): if even the BEST row still carries the -1 unrankable sentinel,
+# every seat had no live vote (only the jitter vote is enabled and no row
+# produced jitter data). There is then nothing to compare, so keep cur instead
+# of letting the sort pick an arbitrary name and "switch" on a meaningless tie.
+# A normal round never reaches this branch: a real score is always >= 0.
+# F28 (v9.12): with W_JIT=0 the full score is never -1 (den = wl+wt+ws > 0
+# after the L400 default guard), so this branch still fires exactly when the
+# F27 world fires; score3's own -1 gets its own guard at the margin below.
+if [ "$BEST_SCORE" = "-1.0" ]; then
+  put_node "$CUR"; RBF="$PUT_RET"; LEDGER=$RBF
+  log "WARN no comparable metric: every seat unrankable (only jitter weight enabled, no jitter data), keep [$CUR] restored [$RBF] cause=NO_METRIC"
+  save_state "$FAIL_N" "$NOW"; SW_DONE=1; exit 0
+fi
+# F28 (v9.12): compare BEST vs CUR on the votes BOTH rows actually have.
+# cur structurally carries jit=-1 (single S3 sample -> no observable span), so
+# in the common round the full-score margin lets a full-data candidate collect
+# the jitter "participation bonus" against a node that simply cannot vote.
+# Rules in order:
+#   0. cur did NOT seat (CUR_LINE empty: it failed the 204/google gates this
+#      round, e.g. c2). v9.10/v9.11 semantics preserved: an unseated cur is
+#      compared against 0 and any seated best outranks it -> rescue switch.
+#      The common-lens guard below must NOT swallow this path.
+#   1. cur seated WITH jitter data (a loss-gate-open round probed cur, or a
+#      candidate-to-candidate handoff left a jittered cur) and BEST has it:
+#      full four-vote margin (v9.11 behaviour, unchanged).
+#   2. either side lacks jitter data (the common round: cur always jit=-1):
+#      score3-vs-score3 margin. score3 covers lat/thr/stab only - votes every
+#      seated row really measured - so the comparison is apples-to-apples.
+# DECIDE prints both lenses so an operator can audit every marginal call.
+CUR_JIT=$(echo "$CUR_LINE" | cut -f7)
+BEST_JIT=$(echo "$BEST_LINE" | cut -f7)
+CUR_JIT_HAVE=1;  case "$CUR_JIT"  in ""|*-*) CUR_JIT_HAVE=0  ;; esac
+BEST_JIT_HAVE=1; case "$BEST_JIT" in ""|*-*) BEST_JIT_HAVE=0 ;; esac
+if [ -z "$CUR_LINE" ]; then
+  M_B="$BEST_SCORE"; M_C="0"; M_LENS=unseated
+elif [ "$CUR_JIT_HAVE" = "1" ] && [ "$BEST_JIT_HAVE" = "1" ]; then
+  M_B="$BEST_SCORE"; M_C="$CUR_SCORE"; M_LENS=full
+else
+  M_B="$BEST_S3";   M_C="$CUR_S3";   M_LENS=common
+fi
+log "DECIDE best=[$BEST_NODE]($BEST_SCORE/s3=$BEST_S3) cur=[$CUR]($CUR_SCORE/s3=$CUR_S3) margin-lens=$M_LENS"
 
-MARGIN=$(awk -v b="$BEST_SCORE" -v c="$CUR_SCORE" -v p="$TIE_PCT" 'BEGIN{if(b*100>=c*(100+p))print 1;else print 0}')
+# F28: guard the degenerate common-lens values BEFORE the margin math. If the
+# chosen lens holds the -1 sentinel (score3 = -1 happens when W_LAT=W_THR=
+# W_STAB=0 is set on purpose - a jitter-only conf - and the jitter vote is
+# the only thing that could decide, exactly dmg1), keep cur: arithmetic on
+# sentinels is how dmg1 shipped. Reached only with a SEATED cur, so the
+# unseated rescue path above is untouched by design.
+KEEP_LENS=0
+case "$M_LENS" in
+  common) case "$M_B$M_C" in *-*) KEEP_LENS=1 ;; esac ;;
+esac
+if [ "$KEEP_LENS" = "1" ]; then
+  put_node "$CUR"; RBF="$PUT_RET"; LEDGER=$RBF
+  log "WARN margin lens [$M_LENS] carries only sentinels (no common vote exists), keep [$CUR] restored [$RBF] cause=NO_COMMON_METRIC"
+  save_state "$FAIL_N" "$NOW"; SW_DONE=1; exit 0
+fi
+MARGIN=$(awk -v b="$M_B" -v c="$M_C" -v p="$TIE_PCT" 'BEGIN{if(b*100>=c*(100+p))print 1;else print 0}')
 
 KEEP=0
 [ "$BEST_NODE" = "$CUR" ] && KEEP=1
@@ -1199,8 +1584,8 @@ if [ "$KEEP" = "1" ]; then
     # "0". With CUR_SCORE=0.0 the next awk divided b*100/0 -> empty output ->
     # a log line reading "margin % under TIE_PCT". Guarding on c+0<=0 fixes
     # it regardless of how the string happens to be formatted.
-    MARGIN_PCT=$(awk -v b="$BEST_SCORE" -v c="$CUR_SCORE" 'BEGIN{ if(c+0<=0) c=0.1; printf "%.0f", b*100/c-100 }')
-    log "OK margin ${MARGIN_PCT}% under TIE_PCT=${TIE_PCT}, keep [$CUR]"
+    MARGIN_PCT=$(awk -v b="$M_B" -v c="$M_C" 'BEGIN{ if(c+0<=0) c=0.1; printf "%.0f", b*100/c-100 }')
+    log "OK margin ${MARGIN_PCT}% under TIE_PCT=${TIE_PCT} (lens=$M_LENS), keep [$CUR]"
   fi
   if [ "$CONFIRMED" = "$CUR" ]; then
     egress_trace
@@ -1226,6 +1611,13 @@ if [ "$CON" != "$BEST_NODE" ]; then
   exit 0
 fi
 log "ACT switch [$CUR] -> [$BEST_NODE] score ${CUR_SCORE}->${BEST_SCORE} [confirmed]"
+# F26: the confirmed-switch landing node is a DIFFERENT node than the one the
+# PREV_BPS baseline was built from. v9.10's overwrite made that moot, but the
+# EMA now carries old-node history forward: if the new node is much faster
+# (>EMA_SPIKE% of the old baseline) every sample would be classed a spike and
+# the baseline could never rise. Zero it (same policy as EXT_CHANGE) so next
+# round re-seeds from a real measurement of the node actually in seat.
+PREV_BPS=0
 egress_trace
 
 rm -f "$RACE_RES" "$SCORED"

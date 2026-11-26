@@ -557,7 +557,7 @@ rule-providers:
     interval: 172800
     proxy: '🚀 节点选择'
 
-# ==================== 分流规则链（30 条） ====================
+# ==================== 分流规则链（33 条） ====================
 rules:
   - RULE-SET,private,DIRECT
   - RULE-SET,private_ip,DIRECT,no-resolve
@@ -569,6 +569,16 @@ rules:
   - DOMAIN-SUFFIX,tenpay.com,DIRECT
   - DOMAIN-SUFFIX,qpic.cn,DIRECT
   - DOMAIN-SUFFIX,qlogo.cn,DIRECT
+
+  # --- QUIC 分流：海外 UDP 443 回落 TCP，国内保持 UDP 直连 ---
+  # 原理：机场 UDP 转发普遍差于 TCP，电视看 YouTube 4K 走 QUIC(UDP 443)
+  # 易卡顿；屏蔽海外 QUIC 后客户端自动回落 TCP-443 按原链路走节点代理。
+  # 下面前两条先把"国内"放行（cn_domain 命中国内域名、cn_ip 命中硬编码
+  # 国内 IP 直连），第三条才把剩余（即海外）的 UDP 443 REJECT。
+  # 只处理 443：8443 少见且 YouTube 主用 443，留观察不动。
+  - AND,((RULE-SET,cn_domain),(NETWORK,UDP),(DST-PORT,443)),DIRECT
+  - AND,((RULE-SET,cn_ip),(NETWORK,UDP),(DST-PORT,443)),DIRECT,no-resolve
+  - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT
 
   - RULE-SET,ai_global,🤖 AI服务
   - RULE-SET,telegram,📱 Telegram

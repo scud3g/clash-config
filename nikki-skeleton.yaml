@@ -577,7 +577,7 @@ rules:
   # 国内 IP 直连），第三条才把剩余（即海外）的 UDP 443 REJECT。
   # 只处理 443：8443 少见且 YouTube 主用 443，留观察不动。
   - AND,((RULE-SET,cn_domain),(NETWORK,UDP),(DST-PORT,443)),DIRECT
-  - AND,((RULE-SET,cn_ip),(NETWORK,UDP),(DST-PORT,443)),DIRECT,no-resolve
+  - AND,((RULE-SET,cn_ip),(NETWORK,UDP),(DST-PORT,443)),DIRECT
   - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT
 
   - RULE-SET,ai_global,🤖 AI服务

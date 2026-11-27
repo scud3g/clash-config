@@ -1,5 +1,40 @@
 #!/bin/sh
 # ============================================================
+# nodeguard.sh v9.14 - visible config failures + one lock domain
+# Base: v9.13 (1800 lines). All v9.13 (F31) and earlier fixes retained.
+# v9.14 changes (two defects found by the R/S robustness rounds):
+#  F32 CONFIG FAILURES WERE INVISIBLE UNDER CRON. Every fatal config path
+#     (missing conf file, unbalanced quote in conf, missing NG_SECRET /
+#     NG_API / NG_GROUP_SEL) died with a message on STDERR only. Cron discards
+#     stderr, so a broken conf = the guard silently stopped and nobody could
+#     tell: the round log stayed empty, `log()` was not even defined yet, and
+#     there was no marker anywhere. Measured: conf with NG_GROUP_SEL="a"b"
+#     -> rc=2, stdout empty, zero log lines.
+#     Fix: a cfg_fatal() helper defined BEFORE the conf is sourced. It writes
+#     one FATAL line into the round log (path taken from the conf when it was
+#     readable and NG_LOG is parseable, else /root/nodeguard.log), echoes the
+#     same line to stderr, and raises a syslog entry via logger when available.
+#     A pure syntax pre-check (sh -n on the conf) turns the one failure mode
+#     that would kill the shell before cfg_fatal() could run (a sourced file
+#     with a syntax error aborts the CURRENT shell at parse time, verified on
+#     ash) into an ordinary fatal path. NG_LOG is also read up front from the
+#     conf text with a cheap grep, because the conf may not be sourceable.
+#  F33 SELFUPDATE AND NODEGUARD USED DIFFERENT LOCK DOMAINS. nodeguard guarded
+#     its round with mkdir /tmp/nodeguard_v9.lock; /root/selfupdate.sh guarded
+#     its deploy with flock on /tmp/nodeguard.single and documented that
+#     "nodeguard's flock holds /tmp/nodeguard.single". nodeguard never touched
+#     that file (grep: NOT FOUND), so the two guards could never see each
+#     other. Measured: with a round in flight, `flock -n
+#     /tmp/nodeguard.single` was acquired instantly. Consequence: at 05:10 the
+#     daily sync can cp a new nodeguard.sh over the file while the running
+#     shell is still reading it, i.e. execute a mix of old and new code, and a
+#     mixed body is exactly the state that can switch nodes on a bad verdict.
+#     Fix: nodeguard now ALSO holds flock -n on /tmp/nodeguard.single for the
+#     whole round (same file, same lock type as selfupdate). The mkdir lock
+#     stays as the primary single-instance gate, so behaviour is unchanged if
+#     flock is missing (checked: absent -> devnull fd, the round proceeds).
+#     selfupdate's existing guard now works unchanged.
+# ------------------------------------------------------------------------
 # nodeguard.sh v9.13 - subscription self-heal (boot-order fallout guard)
 # Base: v9.12 (1625 lines). All v9.12 fixes (F28/F29/F30) retained.
 # v9.13 changes (one additive guard, no gate/scoring change):
@@ -428,11 +463,31 @@
 
 # ---- config ----
 CONF="${NG_CONF:-/root/nodeguard.conf}"   # NG_CONF lets tests use a sandbox conf
-[ -f "$CONF" ] || { echo "missing $CONF" >&2; exit 1; }
+# F32: a fatal config problem used to die on STDERR only, which cron throws
+# away, so a broken conf made the guard disappear silently. cfg_fatal() is
+# defined BEFORE the conf is read so every one of those paths leaves a line in
+# the round log (and in syslog when logger exists).
+# NG_LOG is pre-read from the conf TEXT (grep, no sourcing) because a conf can
+# be unparseable; until then the default log path is assumed.
+NG_LOG_PRE=$(grep -m1 '^[[:space:]]*NG_LOG=' "$CONF" 2>/dev/null | sed 's/^[[:space:]]*NG_LOG=//; s/^"//; s/"$//')
+NG_BOOTLOG="${NG_LOG_PRE:-${NG_LOG:-/root/nodeguard.log}}"
+cfg_fatal(){
+  # $1 = reason (ASCII, becomes part of the log line)
+  _cf_msg="FATAL $1"
+  printf '%s %s\n' "$(date '+%m-%d %H:%M:%S')" "$_cf_msg" >> "$NG_BOOTLOG" 2>/dev/null
+  logger -t nodeguard "$_cf_msg" 2>/dev/null
+  printf '%s: %s\n' "${0:-nodeguard}" "$_cf_msg" >&2
+  exit 2
+}
+[ -f "$CONF" ] || cfg_fatal "missing conf $CONF (no round ran, guard is DOWN until this is fixed)"
+# F32: a syntax error inside a SOURCED file aborts the current shell at parse
+# time, so no in-shell guard can catch it. sh -n is a pure parse (nothing is
+# executed) and therefore the only reliable gate.
+sh -n "$CONF" 2>/dev/null || cfg_fatal "conf $CONF has a shell syntax error (check quotes), guard is DOWN"
 . "$CONF"
-: "${NG_SECRET:?NG_SECRET missing}"
-: "${NG_API:?NG_API missing}"
-: "${NG_GROUP_SEL:?NG_GROUP_SEL missing}"
+[ -n "${NG_SECRET:-}" ]    || cfg_fatal "NG_SECRET missing in $CONF, guard is DOWN"
+[ -n "${NG_API:-}" ]       || cfg_fatal "NG_API missing in $CONF, guard is DOWN"
+[ -n "${NG_GROUP_SEL:-}" ] || cfg_fatal "NG_GROUP_SEL missing in $CONF, guard is DOWN"
 API="$NG_API"
 AH="Authorization: $NG_SECRET"
 SEL="$NG_GROUP_SEL"
@@ -440,7 +495,7 @@ SEL="$NG_GROUP_SEL"
 # V6 (v9.9): single version constant - the per-round log prints this.
 # (v9.6 F14 shipped logging "v9.3": a literal at the log site is how
 # that happens. The mihomo version keeps its own name NG_VER.)
-NG_VERSION=v9.13
+NG_VERSION=v9.14
 
 # v9 tunables (override in conf)
 WIN_SEC=${WIN_SEC:-900}          # mild-anomaly window: 2 hits inside window
@@ -939,6 +994,32 @@ if ! mkdir "$LOCK_DIR" 2> /dev/null; then
   fi
 fi
 trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT INT TERM HUP
+# F33: take the SAME flock the daily selfupdate deploy guard uses, for the
+# whole round. selfupdate (/root/selfupdate.sh) runs `flock -n
+# /tmp/nodeguard.single` and backs off when it is held - but until v9.14 this
+# script never held it, so at 05:10 a deploy could cp a new file over the one
+# the running shell was reading, producing a mixed old/new body. Opening the fd
+# here makes both guards share one lock domain. If flock is not installed the
+# redirect fails harmlessly (fd 9 on /dev/null) and the mkdir lock above is
+# still the single-instance gate.
+NG_FLOCK="${NG_FLOCK:-/tmp/nodeguard.single}"
+if command -v flock >/dev/null 2>&1; then
+  exec 9>>"$NG_FLOCK" 2>/dev/null
+  # Not fatal on contention here: the mkdir lock above already proved we are
+  # the single round, so a held flock can only mean a deploy is in flight;
+  # wait for it (bounded) instead of skipping the round.
+  # busybox flock has NO -w option (usage: [-sxun]), so the bounded wait is a
+  # poll loop; the lock is held by this fd until the script exits.
+  _fl_i=0
+  while [ "$_fl_i" -lt 60 ]; do
+    flock -n 9 2>/dev/null && break
+    sleep 1
+    _fl_i=$((_fl_i+1))
+  done
+  [ "$_fl_i" -ge 60 ] && log "WARN flock $NG_FLOCK still held after 60s, continuing (F33)"
+else
+  exec 9>/dev/null 2>/dev/null
+fi
 # F16: log trim runs inside the critical section (see note above).
 [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 204800 ] && tail -400 "$LOG" > "$LOG.$$.new" && mv "$LOG.$$.new" "$LOG"
 

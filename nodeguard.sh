@@ -1,5 +1,33 @@
 #!/bin/sh
 # ============================================================
+# nodeguard.sh v9.13 - subscription self-heal (boot-order fallout guard)
+# Base: v9.12 (1625 lines). All v9.12 fixes (F28/F29/F30) retained.
+# v9.13 changes (one additive guard, no gate/scoring change):
+#  F31 SUBSCRIPTION SELF-HEAL. The 2026-11-27 incident: /etc/init.d/nikki
+#     fetched the subscription INSIDE start_service, i.e. before the core and
+#     tproxy existed, so curl left the box unproxied, hit the CDN real IP and
+#     was blocked - boot took 67s and finished with success=0, leaving the
+#     panel with a stale profile. The init.d side is now fixed (fetch deferred
+#     until the hijack is live; a PRESENT file no longer re-downloads on boot),
+#     but init.d is NOT opkg-managed on this box, so any future nikki reinstall
+#     silently restores the old order. This guard is the fallback: once per
+#     round, AFTER the API proved alive, if uci success=0 (or the value is
+#     missing/garbage) re-run the same update_subscription OUT OF BAND
+#     (detached, hard 120s cap). Design constraints honoured:
+#       - never blocks the round: the refresh is backgrounded, the round goes
+#         on to screen/race immediately (a 67s CDN stall must not delay it);
+#       - rate limited by the cron tick itself (5min) plus a "near success"
+#         skip (success=1 and update within 6h -> do nothing), so a broken CDN
+#         costs 3 attempts per 15min at worst, not a hot loop;
+#       - purely additive: no state line change (still 4 lines), no new file,
+#         no scoring/gate impact. On success the panel's next scheduled
+#         restart (04:00) picks the fresh profile up; nothing restarts here,
+#         so a heal can never drop the LAN's connectivity mid-round.
+#     NOTE the deliberate non-goal: we do NOT touch a healthy subscription.
+#     A successful fetch only rewrites the stored file; the RUNNING config is
+#     untouched until a restart, so an unnecessary refetch is harmless but a
+#     refetch storm is not - hence the 6h near-success skip.
+# ------------------------------------------------------------------------
 # nodeguard.sh v9.12 - common-vote margin + honest ceilings
 # Base: v9.11 (1487 lines). All v9.11 fixes (F24/F25/F26/F27) retained.
 # v9.12 changes (bug fixes, NOT additive):
@@ -412,7 +440,7 @@ SEL="$NG_GROUP_SEL"
 # V6 (v9.9): single version constant - the per-round log prints this.
 # (v9.6 F14 shipped logging "v9.3": a literal at the log site is how
 # that happens. The mihomo version keeps its own name NG_VER.)
-NG_VERSION=v9.12
+NG_VERSION=v9.13
 
 # v9 tunables (override in conf)
 WIN_SEC=${WIN_SEC:-900}          # mild-anomaly window: 2 hits inside window
@@ -553,6 +581,149 @@ fi
 # rounds add no extra log lines. Diagnostic aid only - nothing gates on it.
 T0=""
 tlog(){ [ "$NG_TIMING" = "1" ] && [ -n "$T0" ] && log "t:$1=$(( $(date +%s) - T0 ))s"; }
+
+# ------------------------------------------------------------
+# F31 (v9.13): subscription self-heal.
+# Called ONCE per round, AFTER the API answered (i.e. the core is up and
+# therefore tproxy is up - the exact condition whose absence broke the boot
+# fetch). Never blocks: the fetch runs detached with a hard 120s cap, so a
+# stalling CDN cannot stretch the round.
+# Skip rules (all cheap, all read-only):
+#   - off switch: NG_SUBHEAL=0
+#   - not a subscription profile -> nothing to do
+#   - uci success=1 AND update within NG_SUBHEAL_OK_WIN -> healthy, skip
+#   - a heal is already in flight ($SUBHEAL_LOCK present) -> skip (belt and
+#     braces: cron already serialises rounds via the main lock, but a slow
+#     detached fetch can outlive its round)
+# Any uci read failure is treated as "unknown" and we heal - a missing
+# success key is exactly the state a broken init.d leaves behind.
+# Concurrency: the lock is a DIRECTORY (atomic mkdir) shared with the init.d
+# side, so a boot-time refresh and a nodeguard heal can never run the same
+# fetch twice. Two fetches would NOT be harmless: update_subscription stages
+# into a FIXED tmpfile ($TEMP_DIR/<section>.yaml), so a second run would
+# overwrite the first one's staging file mid-move.
+# Staleness is judged by AGE (10min), not by PID: a SIGKILL leaves a lock with
+# no owner, and pid reuse on a busy box can keep a dead pid alive. The worst
+# case inside update_subscription is curl -m 120 --retry 3 per request, well
+# under 10min, so age alone is a safe reclaim rule.
+# ------------------------------------------------------------
+SUBHEAL_LOCK="${NG_SUBHEAL_LOCK:-/var/run/nikki/sub.heal.lock}"
+SUBHEAL_BACKOFF="${NG_SUBHEAL_BACKOFF:-/var/run/nikki/sub.heal.next}"
+# F31c: the subscription FILE is the thing the core actually loads, so uci
+# bookkeeping alone cannot prove health. update_subscription writes uci only
+# AFTER a successful mv, but the file can still vanish later (manual rm, a
+# failed mv on a full overlay, a truncated restore from backup). Default path
+# matches SUBSCRIPTIONS_DIR in /etc/nikki/scripts/include.sh.
+NG_SUB_DIR="${NG_SUB_DIR:-/etc/nikki/subscriptions}"
+NG_SUBHEAL=${NG_SUBHEAL:-1}
+NG_SUBHEAL_OK_WIN=${NG_SUBHEAL_OK_WIN:-21600}   # 6h
+NG_SUBHEAL_STALE_MIN=${NG_SUBHEAL_STALE_MIN:-10}
+NG_SUBHEAL_MIN_WAIT=${NG_SUBHEAL_MIN_WAIT:-900}    # 15min first retry
+NG_SUBHEAL_MAX_WAIT=${NG_SUBHEAL_MAX_WAIT:-21600}  # cap at 6h
+case "$NG_SUBHEAL_OK_WIN"    in ''|*[!0-9]*) NG_SUBHEAL_OK_WIN=21600 ;; esac
+case "$NG_SUBHEAL_STALE_MIN" in ''|*[!0-9]*) NG_SUBHEAL_STALE_MIN=10 ;; esac
+case "$NG_SUBHEAL_MIN_WAIT"  in ''|*[!0-9]*) NG_SUBHEAL_MIN_WAIT=900 ;; esac
+case "$NG_SUBHEAL_MAX_WAIT"  in ''|*[!0-9]*) NG_SUBHEAL_MAX_WAIT=21600 ;; esac
+[ "$NG_SUBHEAL_MIN_WAIT" -lt 300 ] && NG_SUBHEAL_MIN_WAIT=300
+[ "$NG_SUBHEAL_MAX_WAIT" -lt "$NG_SUBHEAL_MIN_WAIT" ] && NG_SUBHEAL_MAX_WAIT=$NG_SUBHEAL_MIN_WAIT
+# subheal_check: logs one line and, if needed, starts the detached refresh.
+# Return value is informational only - the caller must never gate on it.
+subheal_check(){
+  [ "$NG_SUBHEAL" = "1" ] || return 0
+  # profile must be subscription:<section>
+  local sh_profile sh_type sh_id
+  sh_profile=$(uci -q get nikki.config.profile 2>/dev/null) || return 0
+  [ -n "$sh_profile" ] || return 0
+  sh_type=$(echo "$sh_profile" | cut -d ':' -f 1)
+  sh_id=$(echo "$sh_profile" | cut -d ':' -f 2)
+  [ "$sh_type" = "subscription" ] || return 0
+  [ -n "$sh_id" ] || return 0
+  local sh_ok sh_upd sh_f
+  sh_ok=$(uci -q get "nikki.$sh_id.success" 2>/dev/null)
+  sh_upd=$(uci -q get "nikki.$sh_id.update" 2>/dev/null)
+  sh_f="$NG_SUB_DIR/$sh_id.yaml"
+  # F31c: a missing/empty subscription file is the one failure the uci marks
+  # cannot see - update_subscription sets success=1 and update ONLY after the
+  # mv, but a later rm/truncate leaves both marks green forever. A zero-byte
+  # file is as fatal as a missing one: the core would fail to parse it.
+  if [ "$sh_ok" = "1" ] && [ -n "$sh_upd" ] && [ -s "$sh_f" ]; then
+    local sh_upd_ts sh_age
+    sh_upd_ts=$(date -d "$sh_upd" +%s 2>/dev/null)
+    case "$sh_upd_ts" in
+      ''|*[!0-9]*) : ;;   # unparseable -> fall through to heal
+      *) sh_age=$(( $(date +%s) - sh_upd_ts ))
+         # A NEGATIVE age means the stamp is in the future (clock stepped back,
+         # or a hand-edited value). Treating it as fresh would freeze the heal
+         # path until the clock caught up, so a negative age heals.
+         if [ "$sh_age" -ge 0 ] && [ "$sh_age" -lt "$NG_SUBHEAL_OK_WIN" ]; then
+           return 0        # healthy and fresh: say nothing, do nothing
+         fi ;;
+    esac
+  fi
+  # F31c: the lock lives in a tmpfs dir the init.d creates on demand. If it is
+  # NOT there, mkdir fails with ENOENT and find returns empty, so the old code
+  # read that as "lock held" and skipped the heal on EVERY round - a permanent
+  # silent stall. Create the parent first; if that fails, the box is in a far
+  # worse state and we bail loudly rather than pretend to be locked out.
+  if [ ! -d "$(dirname "$SUBHEAL_LOCK")" ]; then
+    mkdir -p "$(dirname "$SUBHEAL_LOCK")" 2>/dev/null \
+      || { log "ERR SUBHEAL cannot create $(dirname "$SUBHEAL_LOCK"), skip cause=NO_TMPDIR"; return 0; }
+  fi
+  # atomic claim; reclaim only by age
+  if ! mkdir "$SUBHEAL_LOCK" 2>/dev/null; then
+    if [ -n "$(find "$SUBHEAL_LOCK" -mmin +"$NG_SUBHEAL_STALE_MIN" 2>/dev/null)" ]; then
+      rm -rf "$SUBHEAL_LOCK" 2>/dev/null
+      mkdir "$SUBHEAL_LOCK" 2>/dev/null || { log "SUBHEAL skipped: lock reclaim failed"; return 0; }
+    else
+      log "SUBHEAL skipped: refresh in flight (lock held)"
+      return 0
+    fi
+  fi
+  # F31b backoff: a permanently dead CDN must not cost a 67s fetch every
+  # cron tick. The backoff file holds "<next_epoch> <wait_seconds>"; the wait
+  # DOUBLES per consecutive failure from 15min to a 6h cap, and success
+  # removes the file. It lives in /var/run (tmpfs), so a reboot resets it by
+  # design and no state line is added (the 4-line rule stays intact).
+  # sh_cur is cleared first: a stale value from a previous in-process call
+  # would be doubled as if it were the last recorded wait.
+  sh_hold=0
+  sh_cur=""
+  sh_next=0
+  if [ -f "$SUBHEAL_BACKOFF" ]; then
+    read -r sh_next sh_cur < "$SUBHEAL_BACKOFF" 2>/dev/null
+    case "${sh_next:-x}" in
+      ''|*[!0-9]*) rm -f "$SUBHEAL_BACKOFF" 2>/dev/null; sh_next=0 ;;
+    esac
+    case "${sh_cur:-x}" in ''|*[!0-9]*) sh_cur=$NG_SUBHEAL_MIN_WAIT ;; esac
+    if [ "$sh_next" -gt 0 ] && [ "$(date +%s)" -lt "$sh_next" ]; then
+      sh_hold=1
+    fi
+  fi
+  if [ "$sh_hold" = 1 ]; then
+    rm -rf "$SUBHEAL_LOCK" 2>/dev/null
+    log "SUBHEAL skipped: backoff ${sh_cur}s, next retry $(date -d "@$sh_next" '+%H:%M:%S' 2>/dev/null || echo "$sh_next")"
+    return 0
+  fi
+  log "SUBHEAL subscription [$sh_id] success=[${sh_ok:-missing}] update=[${sh_upd:-none}] -> refresh in background"
+  (
+    trap 'rm -rf "$SUBHEAL_LOCK" 2>/dev/null' EXIT INT TERM HUP
+    /etc/init.d/nikki update_subscription "$sh_id" > /dev/null 2>&1
+    _s=$(uci -q get "nikki.$sh_id.success" 2>/dev/null)
+    if [ "$_s" = "1" ]; then
+      rm -f "$SUBHEAL_BACKOFF" 2>/dev/null
+    else
+      # consecutive failure: double the wait (capped)
+      if [ "$sh_hold" = 0 ] && [ -n "${sh_cur:-}" ]; then
+        _wait=$(( sh_cur * 2 ))
+      else
+        _wait=$NG_SUBHEAL_MIN_WAIT
+      fi
+      [ "$_wait" -lt "$NG_SUBHEAL_MIN_WAIT" ] && _wait=$NG_SUBHEAL_MIN_WAIT
+      [ "$_wait" -gt "$NG_SUBHEAL_MAX_WAIT" ] && _wait=$NG_SUBHEAL_MAX_WAIT
+      echo "$(( $(date +%s) + _wait )) $_wait" > "$SUBHEAL_BACKOFF" 2>/dev/null
+    fi
+  ) > /dev/null 2>&1 &
+}
 # log trim (v8.1 rule: 200KB cap). F15: keep last 400 lines instead of
 # 100 - a round writes 5-15 lines, so 100 lines only covered ~10-30 rounds
 # and the A1 PREV_BPS fallback (grep the previous "OK [cur]" line) could
@@ -836,6 +1007,10 @@ VER_RESP=$(cat "$VER_F"); rm -f "$VER_F"
 NG_VER=$(printf '%s' "$VER_RESP" | tr ',' '\n' | grep -o '"version":"[^"]*"' | head -n1 | cut -d'"' -f4)
 case "$NG_VER" in ""|*[!-.A-Za-z0-9+]*) NG_VER=unreadable ;; esac
 log "RUN $NG_VERSION mihomo=$NG_VER"
+# F31 (v9.13): the core just answered on the API, so tproxy is up - this is
+# the first moment a subscription fetch can leave the box proxied. Heal in
+# the background (never blocks the round).
+subheal_check
 # F10: runtime assert - SEL must be a Selector group. If someone changes
 # the group type to url-test/fallback, /group/{SEL}/delay would UNPIN it
 # (route_groups.go L62-65: only non-Selector groups get ForceSet("")),

@@ -1,5 +1,41 @@
 #!/bin/sh
 # ============================================================
+# nodeguard.sh v9.25 - an unwritable log path made the guard invisible:
+#                      it kept switching nodes with no evidence it had run
+# Base: v9.24. All v9.24 (F57) and earlier fixes retained.
+# v9.25 changes (one defect from round R10, log-rotation coverage):
+#  F58 A LOG PATH THAT CANNOT BE WRITTEN SILENCED THE WHOLE GUARD.
+#      Round R10 was added because the live /root/nodeguard.log was 191738B at
+#      2026-11-28 20:30, i.e. 13KB under the 204800 trim cap, so the F16 trim
+#      was about to fire for the first time in weeks with NO test covering it.
+#      R10 (r10log.sh, 17 PASS) and R10b (r10b.sh, 16 PASS) then covered the
+#      trim itself and its edges. R10b's E3/E4 (NG_LOG in a missing directory /
+#      NG_LOG is a directory) returned rc=0 with EMPTY stderr, which looked
+#      wrong against the F54 note that `: >>bad` kills ash, so it was probed
+#      (r10c/r10e) instead of assumed. Measured facts:
+#        - ash does NOT terminate on a failed redirect of a PLAIN command
+#          (`echo/printf >> bad` -> rc=1, shell continues; r10c A/B/C/E/F)
+#        - it DOES terminate on a failed redirect of the SPECIAL BUILTIN `:`
+#          (r10c D, r10e S1/D) - so any probe must be wrapped in ( )
+#        - a full HEALTHY round with NG_LOG unwritable: ran, switched nodes,
+#          wrote a correct 4-line state, and left NOTHING anywhere - the only
+#          symptom is a stderr line cron discards (r10d D)
+#        - --check reported check_result=ok for all three bad paths
+#          (missing dir / a directory / clean healthy control) - r10d A/B/C
+#      So a typo in NG_LOG (or a /root that is full, or a conf migrated from a
+#      box with a different layout) turns the guard into something that keeps
+#      switching the group while being unobservable: same class as K1, and the
+#      operator's one diagnostic said "ok". Fix, two parts:
+#        1. log() checks the append. On failure every line goes to syslog with
+#           a LOGBAD prefix (self-identifying), once per round plus a one-time
+#           explanation naming the path. Nothing is lost to cron's bit bucket.
+#           Safe shape: `if printf >> f; then` does not kill the shell (r10e
+#           S3/S4); the fallback is proven below with a real round.
+#        2. --check gains core 4: a subshell `( : >> "$LOG" )` append probe.
+#           Fails hard with FAIL_NOT_WRITABLE. The subshell is mandatory (r10e
+#           S1) because `:` outside one would terminate --check itself.
+#      Verified below: see the F58 section of the F57/D64 test notes.
+# ------------------------------------------------------------------------
 # nodeguard.sh v9.24 - a node name containing a TAB silently corrupted the score
 #                      table and switched the group to a node it never measured
 # Base: v9.23. All v9.23 (F55/F56/F56b) and earlier fixes retained.
@@ -988,7 +1024,7 @@ nr(){
 # V6 (v9.9): single version constant - the per-round log prints this.
 # (v9.6 F14 shipped logging "v9.3": a literal at the log site is how
 # that happens. The mihomo version keeps its own name NG_VER.)
-NG_VERSION=v9.24
+NG_VERSION=v9.25
 
 # v9 tunables (override in conf)
 WIN_SEC=${WIN_SEC:-900}          # mild-anomaly window: 2 hits inside window
@@ -1202,7 +1238,36 @@ STATE="${NG_STATE:-/root/.nodeguard.state}"
 LOG="${NG_LOG:-/root/nodeguard.log}"
 LOCK_DIR="${NG_LOCK:-/tmp/nodeguard_v9.lock}"   # F12: sandboxable lock (default unchanged)
 OFFFILE="${NG_OFF:-/root/.nodeguard.off}"   # F10: sandboxable
-log(){ echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG"; }
+# F58 (v9.25): A LOG PATH THAT CANNOT BE WRITTEN MADE THE GUARD INVISIBLE.
+#   Measured on the router (probes r10b E3/E4 and r10d) with NG_LOG in a
+#   directory that does not exist, and with NG_LOG pointing at a directory:
+#     - the round ran normally, switched nodes, wrote a correct 4-line state
+#     - every log() append failed, and ash reports that on stderr ONLY
+#       ("can't create ...: nonexistent directory"), which cron discards
+#     - --check printed check_result=ok, i.e. the operator's one probe said fine
+#     - syslog carried nothing for the round (r10d D: delta=0)
+#   So the guard kept switching the group with ZERO evidence that it had run and
+#   nothing would ever report the broken path. Same class as K1: silent,
+#   permanent, and indistinguishable from "healthy".
+#   Fix: log() detects the failed append and falls back to syslog prefixed
+#   LOGBAD, so the fallback is self-identifying; every line the round writes
+#   survives somewhere queryable (logread). --check gains a hard FAIL too.
+#   Shape matters: `if cmd >> f; then` does NOT terminate the shell on a failed
+#   redirection (measured r10e S2/S3/S4); the special builtin `:` DOES (S1/D),
+#   which is why the probe below is wrapped in a subshell.
+NG_LOGF_OFF=0   # flip to 1 once the fallback has been announced this round
+log(){
+  _lmsg="$1"
+  if printf '%s %s\n' "$(date '+%m-%d %H:%M:%S')" "$_lmsg" >> "$LOG"; then
+    return 0
+  fi
+  logger -t nodeguard "LOGBAD $_lmsg" 2>/dev/null
+  if [ "$NG_LOGF_OFF" = "0" ]; then
+    NG_LOGF_OFF=1
+    logger -t nodeguard "LOGBAD cannot append to NG_LOG=[$LOG] - every line this round goes to syslog only (F58)" 2>/dev/null
+  fi
+  return 0
+}
 # F52/F53b (v9.22): ONE place that removes every per-round scratch file, shared
 # by the early traps and on_exit. The variables are assigned later in the file,
 # so the ones not yet reached expand to empty and are skipped - that is what
@@ -1709,6 +1774,20 @@ if [ "$NG_CHECK" = "1" ]; then
     else
       echo "check_deep_raw_delay_entries=FAIL_no_response"
     fi
+  fi
+  # -- core 4 (F58, v9.25): the log path must be APPENDABLE --
+  # Measured (r10d A/B/C, r10b E3/E4): with NG_LOG in a non-existent directory
+  # or pointing at a directory, the round runs and switches normally while
+  # every log line vanishes and --check still reported ok. The probe is a
+  # subshell because a failed redirect on the special builtin `:` terminates
+  # the shell (r10e S1/D); inside `( )` it merely sets rc, measured S1.
+  # Only the append is tested, so the existing file is not modified.
+  CLOGP=$LOG
+  if ( : >> "$CLOGP" ) 2>/dev/null; then
+    echo "check_log_path=ok [$CLOGP]"
+  else
+    echo "check_log_path=FAIL_NOT_WRITABLE [$CLOGP] - every log line would go to syslog only (F58)"
+    CHK_FAIL=1
   fi
   if [ "$CHK_FAIL" = "1" ]; then
     echo "check_result=FAIL"

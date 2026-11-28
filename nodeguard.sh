@@ -1,5 +1,86 @@
 #!/bin/sh
 # ============================================================
+# nodeguard.sh v9.24 - a node name containing a TAB silently corrupted the score
+#                      table and switched the group to a node it never measured
+# Base: v9.23. All v9.23 (F55/F56/F56b) and earlier fixes retained.
+# v9.24 changes (one defect from the F51 probe series):
+#  F57 A NAME CONTAINING A RAW TAB CROSSED A TAB-DELIMITED BOUNDARY.
+#      Every intermediate structure in the race is TAB separated:
+#        delay pool    "<delay> TAB <name>"        (TPS_ALL)
+#        TYPE_F        "<name>  TAB <type>"        (providers API)
+#        RACE_RES      name TAB lat TAB bps TAB stab TAB loss TAB jit
+#        SCORED        score TAB name TAB lat ...
+#      so a name carrying 0x09 adds fields and every column after the name shifts
+#      by one. The parser does NOT unescape JSON (it scans for "name":"..."), so
+#      it accepts a raw TAB that a real mihomo body can never send (Go's
+#      json.Marshal escapes 0x09 as backslash-t) - but nothing else in the chain
+#      rejects one either, and the harm is not cosmetic:
+#      MEASURED on the router with probe f51dbg (real race, fake curl, the TAB
+#      name present in BOTH prov.json and delay.json so it is a real candidate):
+#        control  name=N3      -> screen[N3 N3] score N3=99.7 DECIDE best=[N3] -> ACT [N1]->[N3]
+#        tabbed   name=N3<TAB>X-> screen[N3<TAB>X N3] SCORE reads
+#            "N3 score=21.9 lat=Xms thr=999B/s stab=450000 loss=100 jit=0ms s3=10.1"
+#        i.e. the TAB name's row was mis-split, its FIELDS BECAME THE COLUMNS
+#        (lat="X", thr=999 default, stab=450000), it scored 21.9 and the round
+#        still reported "DECIDE best=[N3]" - a name assembled from the wreckage.
+#        With a real deployment that is a switch decided on a corrupted score,
+#        or a PUT to a name that does not exist (the F39 failure class again).
+#      Fix, in four places so the boundary can never be crossed again:
+#        1. now_ok(): a byte-count compare after tr -d '\001-\037\177' rejects
+#           any control byte (TAB/CR/ESC/DEL) in a name. Byte count, not ${#1}:
+#           ${#1} counts characters and a trailing LF would be eaten by $().
+#           Verified on the router: TAB/CR/ESC rejected, CJK/emoji/space/punct,
+#           "auto" and "DIRECT" all still accepted.
+#        2. the delay-pool scanner drops any candidate whose NAME has a control
+#           byte (awk hasctrl(), built from sprintf("%c") - [:cntrl:] in tr is
+#           broken on this build, in grep it works, in awk it is not portable).
+#        3. the providers/TYPE_F scanner drops such a name too, so the type
+#           filter cannot re-import it.
+#        4. the group set (GRP_F) is filtered with grep -v '[[:cntrl:]]', the one
+#           place where the POSIX class IS supported on BusyBox v1.37.
+#      A rejected name is simply not a candidate: the pool shrinks by that one
+#      entry, the screen-floor and every other gate behave as before, and a
+#      normal pool is bit-for-bit unchanged (measured: 4 normal nodes, 0 drops).
+# ------------------------------------------------------------------------
+# nodeguard.sh v9.23 - a sanitiser that sanitised nothing, and an exit code that
+#                      said "all good" after the round was shot
+# Base: v9.22. All v9.22 (F52/F53/F53b/F54) and earlier fixes retained.
+# v9.23 changes (two defects from the robustness rounds):
+#  F55 A CONTROL-BYTE SANITISER THAT WAS A COMPLETE NO-OP IN PRODUCTION.
+#      F48 strips control bytes before writing state, using tr -d '[:cntrl:]'.
+#      BusyBox v1.37 tr has NO character-class support: '[:cntrl:]' is parsed as
+#      the literal seven-byte set [ : c n t r l ], so it deleted only those
+#      characters and every real control byte survived. Proof on the router:
+#        printf '[:cnrl]abc\tDEF' | tr -d '[:cntrl:]'  ->  'ab<TAB>DEF'
+#      ('c' gone, TAB untouched). F48 passed on the dev box's GNU tr and did
+#      nothing at all in production - the one failure mode a sanitiser must
+#      never have. Fix: explicit octal span tr -d '\001-\037\177', verified on
+#      the router to delete 0x01-0x1f and 0x7f while keeping 0x20-0x7f, all high
+#      bytes and every UTF-8 multibyte sequence intact. DO NOT "improve" this
+#      back to a character class: tr -cd '[:print:]' on this build emits an EMPTY
+#      string, and tr -cd '\040-\176' would delete every CJK and emoji byte.
+#  F56 A MID-RACE SIGNAL EXITED 0, INDISTINGUISHABLE FROM A NORMAL SUCCESS.
+#      on_exit() was the SINGLE handler for `EXIT INT TERM HUP` and ended with a
+#      literal `exit 0`. Measured on the router with probe r7j, real race, TERM
+#      3s after "RACE start", 5/5 runs:
+#          rc=0  midrace_line=1  restored_line=1  act=0
+#      while the SAME round killed BEFORE the race (the F41 arm at the lock)
+#      returns 130. So the exit-code channel reported success for a round that
+#      had been shot mid-restore, and only a log grep could tell the two apart.
+#      Nothing on this box consumed rc (crontab discards it, selfupdate gates on
+#      `flock -n 8` not on nodeguard's status, no init.d wrapper), so nothing was
+#      broken yet - but the code was a booby trap for the next consumer and made
+#      any wrapper's health math wrong. Fix: the signal arms record 128+N in
+#      OE_RC (the POSIX convention the pre-race arm already used) and exit
+#      through the EXIT arm; on_exit() carries OE_RC out instead of a hardcoded
+#      0, so a normal end still returns whatever the body returned. on_exit is
+#      now RE-ENTRY GUARDED (OE_RUN), because exiting inside a signal arm re-runs
+#      the EXIT trap in ash: without the guard the restore would run twice, which
+#      is ~13s of extra traffic on a round already told to stop. Verified on the
+#      router: INT/TERM/HUP -> 130/143/129, three-TERM storm -> 143 with the
+#      restore performed exactly once, normal round -> 0 and the lock/scratch
+#      cleanup unchanged.
+# ------------------------------------------------------------------------
 # nodeguard.sh v9.21 - a numeric value with a leading zero is read as octal
 # Base: v9.20 (2341 lines). All v9.20 (F41/F42) and earlier fixes retained.
 # v9.21 changes (two defects found by the tenth and thirteenth robustness rounds):
@@ -907,7 +988,7 @@ nr(){
 # V6 (v9.9): single version constant - the per-round log prints this.
 # (v9.6 F14 shipped logging "v9.3": a literal at the log site is how
 # that happens. The mihomo version keeps its own name NG_VER.)
-NG_VERSION=v9.21
+NG_VERSION=v9.24
 
 # v9 tunables (override in conf)
 WIN_SEC=${WIN_SEC:-900}          # mild-anomaly window: 2 hits inside window
@@ -1122,6 +1203,21 @@ LOG="${NG_LOG:-/root/nodeguard.log}"
 LOCK_DIR="${NG_LOCK:-/tmp/nodeguard_v9.lock}"   # F12: sandboxable lock (default unchanged)
 OFFFILE="${NG_OFF:-/root/.nodeguard.off}"   # F10: sandboxable
 log(){ echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG"; }
+# F52/F53b (v9.22): ONE place that removes every per-round scratch file, shared
+# by the early traps and on_exit. The variables are assigned later in the file,
+# so the ones not yet reached expand to empty and are skipped - that is what
+# lets the traps installed at the lock (long before VER_F exists) use it too.
+# Two leaks measured on the router motivated this: probe r4leak showed an
+# API_DOWN exit leaving /tmp/ng9_typ.* behind on EVERY round (98 files had piled
+# up on the live box), and probe r4d7 case C showed a TERM during S2 leaving 2
+# files. Both are tmpfs, i.e. the same filesystem the API and the flock use.
+ng_rm_tmp(){
+  for _ngtmp in "$VER_F" "$TYP_F" "$TYPE_F" "$G_F" "$R_F" "$B_F" \
+                "$GRP_F" "$DLY_F" "$CG_F" "$MS_F" "$RACE_RES" "$SCORED"; do
+    [ -n "$_ngtmp" ] && rm -f "$_ngtmp" 2>/dev/null
+  done
+  return 0
+}
 # F29 (v9.12): one WARN per round if the conf still carries the
 # removed JIT_NEUTRAL key (parsed earlier, up in the conf section).
 # Sits here, AFTER log() - a POSIX sh function must be defined
@@ -1368,6 +1464,16 @@ now_ok(){
   [ -z "$1" ] && return 1
   [ "${#1}" -gt 256 ] && return 1
   case "$1" in *'"'*|*"'"*|*'\'*|*'{'*|*'}'*|*'<'*|*'>'*|*'`'*) return 1 ;; esac
+  # F57 (v9.24): a control byte in a name crosses every TAB-delimited boundary
+  # downstream (RACE_RES columns shift, the SCORED row mis-splits and the round
+  # can switch the group on a corrupted score). Verified on the router: TAB, CR,
+  # ESC, DEL and a mid-string LF all rejected; CJK, emoji, space, comma, parens,
+  # brackets, '*' and high bytes still accepted. The octal span is mandatory -
+  # tr -d '[:cntrl:]' is a NO-OP on this busybox (see F55). A plain compare is
+  # used (not a byte count): measured on the router to give the identical
+  # verdict for all 15 probe cases, and it saves a fork on a per-node hot path.
+  _ns=$(printf '%s' "$1" | tr -d '\001-\037\177')
+  [ "$_ns" = "$1" ] || return 1
   return 0
 }
 # V1 (v9.9): GROUP_NOW = the group's actual landing point, assigned ONLY
@@ -1632,7 +1738,20 @@ if ! mkdir "$LOCK_DIR" 2> /dev/null; then
     exit 0
   fi
 fi
-trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+# F54 (v9.22): F44 made the lock open PROBE-guarded, but the window between the
+# probe and the real `exec 9>>` was still fatal and still SILENT. Re-measured on
+# the router with probe r4trap T1/T2: when the main `exec 9>>dir/that/died`
+# fails, ash terminates the shell with rc=1, but the EXIT trap DOES run. So the
+# round can be made loud instead of invisible: FLOCK_OPENING marks the exact
+# span where a death means "the deploy lock open failed", and the EXIT arm below
+# writes a FATAL line before releasing the lock. Probe r4r3 case 9R reproduced
+# the old behaviour exactly - no TAIL, no OR-BRANCH, no log line, FLOCK_FD
+# already set - i.e. a round that silently vanished while holding the mkdir lock.
+# A full elimination is impossible (busybox ash makes a failed `exec` redirect
+# unconditionally fatal, so the main shell cannot fall back by itself); the
+# honest fix is to make the failure diagnosable and to leave no lock behind.
+FLOCK_OPENING=0
+trap '[ "$FLOCK_OPENING" = "1" ] && log "ERR deploy lock open failed mid-round (F54): shell terminated by exec redirect, round aborted cause=FLOCK_OPEN_DIED"; rmdir "$LOCK_DIR" 2>/dev/null' EXIT
 # F41 (v9.19): a TERM/INT/HUP that arrives BEFORE SECTION 6 installs its
 # on_exit trap must END the round. The old single trap
 #   trap 'rmdir "$LOCK_DIR"' EXIT INT TERM HUP
@@ -1645,9 +1764,24 @@ trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
 # exactly the double-round the mkdir lock exists to prevent, and the reason
 # `trap` must exit. exit 130 keeps it distinguishable from a normal 0.
 # The EXIT arm above still covers every normal path, and SECTION 6's later
-# `trap 'on_exit' EXIT INT TERM HUP` replaces both arms once the race starts
-# (on_exit does its own restore and exits).
-trap 'rmdir "$LOCK_DIR" 2>/dev/null; exit 130' INT TERM HUP
+# per-signal `trap ... on_exit` set replaces both arms once the race starts
+# (on_exit does its own restore and then exits with OE_RC).
+# F53b (v9.22): the INT/TERM/HUP arm below must clean the SAME scratch files as
+# EXIT. Before this it only did `rmdir "$LOCK_DIR"`, so a signal during S2/S3/S5
+# left /tmp/ng9_* behind: probe r4d7 case C on the router measured 2 leftovers
+# after one TERM, probe r4r2 case 3/4 measured 0 only because those runs happened
+# to be killed before the files were created. ng_rm_tmp covers every variable
+# that exists at the moment the signal lands and silently skips the rest.
+# F56b (v9.23): the same defect as F56, one phase earlier. This arm hardcoded
+# `exit 130` for INT *and* TERM *and* HUP, so a TERM before the race reported the
+# exit status of a Ctrl-C: measured on the router with probe r7d L3 - `kill
+# -TERM` returned RC=130. An operator (or a wrapper, or a supervisor restarting
+# on 143) cannot distinguish "the operator pressed Ctrl-C" from "the system asked
+# us to shut down". 128+N is the only value that carries the identity of the
+# signal, and it costs nothing: one arm per signal, as in SECTION 6 below.
+trap 'ng_rm_tmp; rmdir "$LOCK_DIR" 2>/dev/null; exit 130' INT
+trap 'ng_rm_tmp; rmdir "$LOCK_DIR" 2>/dev/null; exit 143' TERM
+trap 'ng_rm_tmp; rmdir "$LOCK_DIR" 2>/dev/null; exit 129' HUP
 # F33: take the SAME flock the daily selfupdate deploy guard uses, for the
 # whole round. selfupdate (/root/selfupdate.sh) runs `flock -n
 # /tmp/nodeguard.single` and backs off when it is held - but until v9.14 this
@@ -1675,7 +1809,12 @@ if command -v flock >/dev/null 2>&1; then
   # The probe opens the real file (>> creates it) and closes it on subshell
   # exit, so a successful probe leaves no lock held and no state behind.
   if ( exec 9>>"$NG_FLOCK" ) 2>/dev/null; then
-    exec 9>>"$NG_FLOCK" 2>/dev/null || FLOCK_FD=0
+    # F54: arm the FATAL-reporting EXIT trap for exactly this redirect. If the
+    # shell dies here (the probe passed but the real open still fails - tmpfs
+    # went read-only or full in between), the trap above logs why.
+    FLOCK_OPENING=1
+    exec 9>>"$NG_FLOCK" 2>/dev/null
+    FLOCK_OPENING=0
     FLOCK_FD=1
   else
     FLOCK_FD=0
@@ -1790,7 +1929,52 @@ RTS_LOG=$(printf '%s' "$RTS_LOG" | tr ',' '\n' | awk -v now="$NOW" '$1+0>0 && $1
 # F8: 4th line = PREV_BPS (old 3-line state -> missing -> fallback 0)
 # N1: atomic write - a killed round must not leave a truncated state
 # (half-written line 1 zeroes FAIL_N and resets cooldown/budget).
-save_state(){ printf '%s\n%s\n%s\n%s\n' "v9:$1:$2:$RACE_TS" "LEDGER=$LEDGER" "RTS_LOG=$RTS_LOG" "PREV_BPS=$PREV_BPS" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"; }
+# F48 (v9.22): THE 4-LINE INVARIANT MUST BE SELF-ENFORCED AT THE WRITE SIDE.
+# LEDGER/RTS_LOG/PREV_BPS are interpolated straight into the file, so any byte
+# that the reader treats as a line break splits one field into two and shifts
+# every later line: measured on v9.21 by planting a state whose LEDGER carried a
+# literal newline - the file became 5 lines, the next round read "LEDGER=N" and
+# lost PREV_BPS entirely (RTS_LOG= got parsed as line 4, PREV_BPS fell back to 0),
+# which silently resets the F26/F34 baseline and the race cooldown accounting.
+# Today a raw newline cannot arrive from the normal API path (JSON escapes it to
+# the two characters \n, measured), but "cannot arrive" is exactly the kind of
+# assumption that breaks when the source changes (a hand-edited state, a restored
+# backup from another tool, a future provider name field, a CRLF-mangled copy).
+# A 4-line file is a hard contract of this script, so enforce it where it is
+# written instead of trusting every upstream encoder forever: strip every control
+# byte from the three free-form fields, i.e. 0x01-0x1f (which covers TAB, LF, CR)
+# plus 0x7f. Node names stay readable because every byte >= 0x20 survives.
+#
+# F55 (v9.23): the original F48 sanitiser used tr -d '[:cntrl:]'. That expression
+# was measured to be a COMPLETE NO-OP on the router. BusyBox v1.37 tr has no
+# character-class support at all: it parses '[:cntrl:]' as the LITERAL byte set
+# [ : c n t r l ] and deletes only those seven characters. Proof on the router:
+#   printf '[:cnrl]abc\tDEF' | tr -d '[:cntrl:]'   ->  'ab\tDEF'
+# ('c' vanished because it is a literal set member, while the real control bytes
+# survived untouched). Same for [:digit:] -> 'a1b2c3' stays 'a1b2c3'. So F48
+# passed on the dev box's GNU tr and silently did nothing in production, which is
+# exactly the failure mode a sanitiser must never have.
+# The fix uses an explicit octal span, verified on the router to delete 0x01-0x1f
+# and 0x7f while leaving 0x20-0x7f, ALL high bytes 0x80-0xff and every UTF-8
+# multibyte sequence intact (a backslash 0x5c survives too, so a name containing
+# one is not mangled).
+# DO NOT "improve" this back to a character class. tr -cd '[:print:]' on this
+# busybox keeps the literal set and therefore emits an EMPTY string (measured: 0
+# bytes), and tr -cd '\040-\176' would delete every CJK and emoji byte. The octal
+# span is the only portable form on this build.
+# F49 (v9.22): the sanitiser temporaries are named _f48* ON PURPOSE. POSIX sh has
+# no local, so any helper that assigns a plain _x leaks it into the caller's
+# namespace; an audit of every single-underscore name in this file found save_state
+# sharing _sp with ng_ceiling (which uses _sp for SPEED_TRIES*SPEED_MAX and reads it
+# three more times in the same function). Today nothing observes the value across
+# the two, so it is not reachable - but relying on call ORDER for correctness is
+# exactly what a later edit breaks silently, so the write side gets its own names.
+save_state(){
+  _f48l=$(printf '%s' "$LEDGER" | tr -d '\001-\037\177')
+  _f48r=$(printf '%s' "$RTS_LOG" | tr -d '\001-\037\177')
+  _f48p=$(printf '%s' "$PREV_BPS" | tr -d '\001-\037\177')
+  printf '%s\n%s\n%s\n%s\n' "v9:$1:$2:$RACE_TS" "LEDGER=$_f48l" "RTS_LOG=$_f48r" "PREV_BPS=$_f48p" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+}
 
 # F35 (v9.16): the F34 unstick streak is stored as "N:TS" in tmpfs, so a round
 # that produced no sample cannot donate its count to a later one. The file is
@@ -1879,7 +2063,15 @@ TYP_F=/tmp/ng9_typ.$$
 ( exec 9>&- 2>/dev/null; curl -s -m 3 -H "$AH" "$API/proxies/$(enc "$SEL")" > "$TYP_F" 2>/dev/null ) &
 wait
 VER_RESP=$(cat "$VER_F"); rm -f "$VER_F"
-[ -z "$VER_RESP" ] && { log "WARN mihomo api unreachable, skip cause=API_DOWN"; exit 0; }
+# F52 (v9.22): the API_DOWN early exit used to leave TYP_F behind. S2 launches
+# BOTH reads in parallel (ver + type) so TYP_F is already created by the time
+# the version read comes back empty; the old `exit 0` released the lock, wrote
+# the WARN and walked away without removing it. Measured on the router with
+# probe r4leak: 20 consecutive API_DOWN rounds leaked exactly 20
+# /tmp/ng9_typ.* files, and `ls /tmp/ng9_typ.* | wc -l` was 98 on the live box -
+# an unbounded growth on tmpfs, the very filesystem the API and the flock live
+# on. Every early exit below this line is audited for the same shape.
+[ -z "$VER_RESP" ] && { rm -f "$TYP_F"; log "WARN mihomo api unreachable, skip cause=API_DOWN"; exit 0; }
 NG_VER=$(printf '%s' "$VER_RESP" | tr ',' '\n' | grep -o '"version":"[^"]*"' | head -n1 | cut -d'"' -f4)
 case "$NG_VER" in ""|*[!-.A-Za-z0-9+]*) NG_VER=unreadable ;; esac
 log "RUN $NG_VERSION mihomo=$NG_VER"
@@ -1894,8 +2086,10 @@ subheal_check
 SEL_TYPE=$(tr ',' '\n' < "$TYP_F" | grep -o '"type":"[^"]*"' | head -n1 | sed 's/^"type":"//; s/"$//')
 case "$SEL_TYPE" in
   Selector) : ;;
-  "")      log "WARN cannot read group type, skip round cause=GROUP_TYPE"; exit 0 ;;
-  *)       log "ERR group [$SEL] type is [$SEL_TYPE] not Selector; stage-1 delay would UNPIN it, REFUSE to run. Fix NG_GROUP_SEL or yaml. cause=GROUP_TYPE"; exit 0 ;;
+  # F52: both arms below exit while TYP_F is still on disk (it is only removed
+  # on the success path, at the CUR read). Same leak shape, same tmpfs.
+  "")      rm -f "$TYP_F"; log "WARN cannot read group type, skip round cause=GROUP_TYPE"; exit 0 ;;
+  *)       rm -f "$TYP_F"; log "ERR group [$SEL] type is [$SEL_TYPE] not Selector; stage-1 delay would UNPIN it, REFUSE to run. Fix NG_GROUP_SEL or yaml. cause=GROUP_TYPE"; exit 0 ;;
 esac
 # F39 (v9.19): same class as get_now - the body must not be split on ','.
 # grep -o scans chars, not comma-delimited tokens, so a name carrying a comma
@@ -2153,17 +2347,31 @@ TYPE_N=0
 # F36a: drop the inherited flock fd in each S5 probe (see the S2 note).
 ( exec 9>&- 2>/dev/null; curl -s -m 15 -H "$AH" "$API/group/$SELU/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=3000" > "$DLY_F" 2>/dev/null ) &
 ( exec 9>&- 2>/dev/null; curl -s -m 15 -H "$AH" "$API/providers/proxies" 2>/dev/null | tr '{' '\n' | awk -v t="$PROV_TYPES" '
-  BEGIN { n = split(t, a, "|"); for (i=1;i<=n;i++) w[a[i]] = 1 }
+  BEGIN {
+    n = split(t, a, "|"); for (i=1;i<=n;i++) w[a[i]] = 1
+    # F57 (v9.24): build the control-byte set once. sprintf("%c",9) is a raw TAB,
+    # which is the only portable way to name it inside an awk program (a literal
+    # "\t" inside a regex is a GNU extension; [:cntrl:] is not portable in awk).
+    for (i=1;i<32;i++) CTL = CTL sprintf("%c", i)
+    CTL = CTL sprintf("%c", 127)
+  }
+  function hasctrl(s,   i, L, c) {
+    L = length(s)
+    for (i = 1; i <= L; i++) { c = substr(s, i, 1); if (index(CTL, c)) return 1 }
+    return 0
+  }
   {
     n1 = index($0, "\"name\":\""); if (!n1) next
     r = substr($0, n1+8); n2 = index(r, "\""); if (!n2) next; name = substr(r, 1, n2-1)
     t1 = index($0, "\"type\":\""); if (!t1) next
     r2 = substr($0, t1+8); t2 = index(r2, "\""); if (!t2) next; typ = substr(r2, 1, t2-1)
-    if (w[typ]) print name "\t" typ
+    # F57: a control byte in the NAME would be written into TYPE_F as a TAB and
+    # break the "name TAB type" contract that the type filter reads back.
+    if (w[typ] && !hasctrl(name)) print name "\t" typ
   }' > "$TYPE_F" ) &
 ( exec 9>&- 2>/dev/null; curl -s -m 10 -H "$AH" "$API/proxies" 2>/dev/null \
   | tr '{' '\n' | grep -o '"name":"[^"]*"' | sed 's/^"name":"//; s/"$//' \
-  | sort -u > "$GRP_F" ) &
+  | grep -v '[[:cntrl:]]' | sort -u > "$GRP_F" ) &
 wait
 DELAY_JSON=$(cat "$DLY_F"); rm -f "$DLY_F"
 if [ -z "$DELAY_JSON" ]; then
@@ -2195,6 +2403,17 @@ fi
 # all parse, and {"bad":null} / {"x":{"a":5}} emit nothing.
 TYPE_N=$(grep -c . "$TYPE_F" 2>/dev/null)
 TPS_ALL=$(echo "$DELAY_JSON" | awk '
+  BEGIN {
+    # F57 (v9.24): the control-byte set, built from sprintf("%c") because a
+    # literal "\t" regex is a GNU extension and awk has no portable [:cntrl:].
+    for (i=1;i<32;i++) CTL = CTL sprintf("%c", i)
+    CTL = CTL sprintf("%c", 127)
+  }
+  function hasctrl(s,   i, L, c) {
+    L = length(s)
+    for (i = 1; i <= L; i++) { c = substr(s, i, 1); if (index(CTL, c)) return 1 }
+    return 0
+  }
   {
     s = $0
     while (match(s, /[{,][ \t]*"[^"\\]*":[0-9]+/)) {
@@ -2205,13 +2424,36 @@ TPS_ALL=$(echo "$DELAY_JSON" | awk '
       if (p > 1) {
         nm = substr(m, 1, p - 1)
         dv = substr(m, p + 2)
-        if (nm != "" && dv ~ /^[0-9]+$/) printf "%s\t%s\n", dv, nm
+        # F57: the output line is "delay TAB name", so a name carrying a TAB/CR
+        # would inject extra fields into every downstream TAB consumer (screen,
+        # RACE_RES, the score table). Such a name is dropped here, before it can
+        # ever be a candidate. Measured harm without this gate: f51dbg case B.
+        # The rejection is also ANNOUNCED (a marker line starting with 0x01,
+        # which no valid pool line can - every real line starts with a digit -
+        # so the shell can count and strip it below). A pool that silently
+        # shrinks would be the same half-accounting F18 removed elsewhere.
+        if (nm != "" && dv ~ /^[0-9]+$/) {
+          if (hasctrl(nm)) printf "\001%s\n", nm
+          else printf "%s\t%s\n", dv, nm
+        }
       }
     }
   }' \
   | grep -v -e 'DIRECT' -e '自动选择' -e '其他地区' -e '建议' -e '订阅' \
             -e '官网' -e '剩余' -e '重置' -e '到期' -e '套餐' -e '：' \
             -e '倍率' -e '勿跑' -e '过期' -e '失联' )
+
+# F57 (v9.24): count and strip the 0x01-prefixed rejection markers emitted by the
+# scanner above. Done BEFORE the group/type filters so the reported number is the
+# true count of bad names, and because those filters key on column 2 (a marker
+# line has no TAB at all). A valid pool line always starts with a digit, so a
+# 0x01 lead byte cannot collide with one.
+BADNM_N=$(printf '%s\n' "$TPS_ALL" | grep -c "$(printf '\001')" )
+[ -z "$BADNM_N" ] && BADNM_N=0
+if [ "$BADNM_N" -gt 0 ] 2>/dev/null; then
+  log "WARN dropped $BADNM_N candidate(s) whose name carries a control byte - a TAB inside a name would break every TAB-delimited column downstream (F57)"
+  TPS_ALL=$(printf '%s\n' "$TPS_ALL" | grep -v "$(printf '\001')")
+fi
 
 # F30 (v9.12): the authoritative GROUP set is the one the PARALLEL $API/proxies
 # fetch above already wrote to GRP_F. v9.11 refetched it serially (-m10) right
@@ -2333,33 +2575,85 @@ RACE_RES=/tmp/ng9_race.$$        # format: name TAB lat TAB medbps TAB stab
 SCORED=/tmp/ng9_score.$$
 SW_DONE=0
 TERM_SIG=0
+# F56 (v9.23): a signal that lands mid-race used to exit 0. on_exit() was the
+# SINGLE handler for `EXIT INT TERM HUP` and it ended with a literal `exit 0`,
+# so "killed by TERM after a successful restore" was indistinguishable from
+# "finished normally" on the exit-code channel. Measured with probe r7j on the
+# router (5/5 runs, real race, TERM 3s after RACE start):
+#     rc=0  midrace_line=1  restored_line=1  act=0
+# and the same round killed BEFORE the race (the F41 arm at the lock) returns
+# 130. Two different signals, two different phases, and an operator or a
+# wrapper could only tell them apart by grepping the log.
+# Nothing on THIS box consumed rc (crontab discards it, selfupdate gates on
+# flock -n 8 not on nodeguard's status, no init.d wrapper), so this was not
+# breaking anything today - but an exit code that says "all good" after the
+# round was shot is a booby trap for the next consumer, and "TRAP exit
+# mid-race" + rc=0 also makes a wrapper's own health math wrong.
+# Fix: OE_RC carries the signal's exit status (128+N, the POSIX convention
+# already used by the pre-race arm) and the EXIT arm preserves whatever the
+# body returned. on_exit() is re-entry guarded because a signal arm now exits
+# THROUGH the EXIT arm, so the function is entered twice per signal and the
+# restore must run exactly once.
+OE_RUN=0
+OE_RC=0
 
 # exit guard: never leave group on a half-tested node
 on_exit(){
+  # F56: second entry is the natural consequence of `exit` inside a signal arm
+  # (ash re-runs the EXIT trap). The restore below must NOT run twice: a second
+  # get_now/put_node pair is ~13s of traffic on a round that was told to stop,
+  # and the lock is already gone by then. Just carry the code out.
+  if [ "$OE_RUN" = "1" ]; then exit "$OE_RC"; fi
+  OE_RUN=1
   TERM_SIG=1
-  rmdir "$LOCK_DIR" 2>/dev/null
-  rm -f "$RACE_RES" "$SCORED" 2>/dev/null
+  # F53 (v9.22): THE LOCK MUST OUTLIVE THE RESTORE. This function used to rmdir
+  # the lock FIRST and then spend up to ~13s restoring the group (get_now -m3,
+  # put_node = 2 tries x (5s+1s)). Measured on the router with probe r4r3 case
+  # 5R: a TERM landed mid-race, and at t=7s - while the round was still alive
+  # and still restoring - a second `mkdir $LOCK_DIR` SUCCEEDED. That is exactly
+  # the double-round the lock exists to prevent: cron `*/5` can fire inside the
+  # restore window, start a second round, and two rounds then drive the same
+  # group. Releasing the lock is now the LAST thing this trap does, after the
+  # restore attempt has finished (success or failure).
+  # F52/F53b: same single scratch-file sweep the early traps use.
+  ng_rm_tmp
   [ -n "$GRP_F" ] && rm -f "$GRP_F"
-  [ "$SW_DONE" = "1" ] && exit 0
-  CN=$(get_now); now_ok "$CN" || exit 0
-  [ "$CN" = "$CUR" ] && exit 0
-  # V1: CN is a real readback, so it is the truth about GROUP_NOW. Resync
-  # BEFORE the restore, otherwise a stale GROUP_NOW could make put_node
-  # skip the very restore this trap exists to perform.
-  GROUP_NOW="$CN"
-  # F2: capture the result; only claim "restored" if it really happened.
-  # Old v9.1 threw the return value away and always logged "restored",
-  # so a failed recovery read as success (worst case: TERM landed on a
-  # candidate while it was being measured).
-  put_node "$CUR"; RB="$PUT_RET"
-  if [ "$RB" = "$CUR" ]; then
-    log "TRAP exit mid-race: group was [$CN], restored [$CUR]"
-  else
-    log "ERR TRAP restore FAILED (wanted [$CUR], actual [$RB]) - group left on [$CN]!!! MANUAL CHECK REQUIRED cause=RESTORE_FAIL"
+  if [ "$SW_DONE" != "1" ]; then
+    CN=$(get_now); 
+    if now_ok "$CN" && [ "$CN" != "$CUR" ]; then
+      # V1: CN is a real readback, so it is the truth about GROUP_NOW. Resync
+      # BEFORE the restore, otherwise a stale GROUP_NOW could make put_node
+      # skip the very restore this trap exists to perform.
+      GROUP_NOW="$CN"
+      # F2: capture the result; only claim "restored" if it really happened.
+      # Old v9.1 threw the return value away and always logged "restored",
+      # so a failed recovery read as success (worst case: TERM landed on a
+      # candidate while it was being measured).
+      put_node "$CUR"; RB="$PUT_RET"
+      if [ "$RB" = "$CUR" ]; then
+        log "TRAP exit mid-race: group was [$CN], restored [$CUR]"
+      else
+        log "ERR TRAP restore FAILED (wanted [$CUR], actual [$RB]) - group left on [$CN]!!! MANUAL CHECK REQUIRED cause=RESTORE_FAIL"
+      fi
+    fi
   fi
-  exit 0
+  # F53: lock released only now, once the group state is settled.
+  rmdir "$LOCK_DIR" 2>/dev/null
+  # F56: block further signals for the remainder of the trap. A second TERM
+  # arriving while the restore is still running used to re-enter via the signal
+  # arm and (in the old code) simply exit 0 mid-restore. Now the restore body is
+  # protected: the round has already decided to die, and no later signal may
+  # perturb the group state it is writing.
+  trap '' INT TERM HUP
+  exit "$OE_RC"
 }
-trap 'on_exit' EXIT INT TERM HUP
+# F56: ONE body (on_exit) but two arming paths - a normal end keeps whatever the
+# body returned, a signal first records 128+N. `exit` inside the signal arm then
+# enters on_exit through the EXIT arm; OE_RUN makes that second pass a no-op.
+trap 'on_exit' EXIT
+trap 'OE_RC=130; on_exit' INT
+trap 'OE_RC=143; on_exit' TERM
+trap 'OE_RC=129; on_exit' HUP
 
 # ---- F23 (v9.8): commit budget slot + cooldown at the FIRST real seat ----
 # SECTION 5a only checked. Nothing is spent until some node actually

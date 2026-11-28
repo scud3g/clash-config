@@ -1,5 +1,328 @@
 #!/bin/sh
 # ============================================================
+# nodeguard.sh v9.21 - a numeric value with a leading zero is read as octal
+# Base: v9.20 (2341 lines). All v9.20 (F41/F42) and earlier fixes retained.
+# v9.21 changes (two defects found by the tenth and thirteenth robustness rounds):
+#  F43 A LEADING ZERO TURNED A NUMBER INTO OCTAL AND KILLED THE ROUND.
+#      Every numeric knob and state field is validated with
+#        case "$V" in ''|*[!0-9]*) V=<default> ;; esac
+#      which tests only the CHARACTER SET, so "08", "09", "010" all pass.
+#      POSIX arithmetic then reads a leading 0 as octal, and 8/9 are not octal
+#      digits: $((08+1)) is a FATAL "arithmetic syntax error" and busybox ash
+#      ABORTS THE WHOLE SCRIPT at that line. Under cron stderr is discarded, so
+#      the round dies silently with no log line saying why. A leading-zero value
+#      that IS valid octal ("010", "0125") is the quieter half of the same bug:
+#      it is silently read as 8 / 85, so the guard keeps running on a wrong
+#      number - e.g. PREV_BPS=0100000 becomes 32768 and the F26 spike rule then
+#      rejects every honest sample, re-creating the F34 ratchet permanently.
+#      Every input is reachable without malice: a state file restored from a
+#      backup, hand-edited while debugging, produced by an older tool, a conf
+#      knob typed as "08" by someone copying a padded value (dates, sizes,
+#      zero-padded counters), or a forged "bps=080000" in the log fallback.
+#      Measured in sandbox probes p46/p47 against v9.20 (real rounds, fake curl):
+#        FAIL_N=08 + one mild hit   -> rc=2, log stops right after the OK line
+#        FAIL_N=8  (control)        -> rc=0, full 14-line round
+#        RACE_TS=08 (healthy round) -> rc=2, not even a second log line
+#        RACE_TS=08 (severe round)  -> rc=2
+#        PREV_BPS=0100000           -> rc=0 but baseline read as octal 32768:
+#                                      "F26 spike ignored ... 300% of baseline
+#                                      0100000B/s", baseline stuck forever
+#        --check with RACE_TS=08    -> rc=2, "arithmetic syntax error" on stderr
+#        TRY204=08 (conf)           -> rc=0 but "TRAP exit mid-race: group was
+#                                      [N3], restored [N1]" - i.e. the round
+#                                      crashed mid-race and was only cleaned up
+#                                      by the EXIT trap
+#        RACE_CD=08 / THRESH_BPS=030000 / TOP_PICK=02 / SPEED_TRIES=08
+#                                   -> rc=0, silently misread as octal
+#      Fix: nn() / nnall() strip leading zeros from an ALREADY-NUMERIC value, in
+#      place, with no fork (eval on a literal variable name at each call site).
+#      Non-numeric values are left untouched for the case guards, so every call
+#      site sits AFTER its guard and BEFORE the first $(( )) or [ -lt ] that
+#      touches the value. "0" is preserved (the loop needs two characters).
+#      Call sites: conf knob guards (knobs + weights + SUBHEAL), SECTION 1 state
+#      fields, spk_read()'s "N:TS", the --check state parser, and the log
+#      fallback for PREV_BPS. The RTS_LOG budget counter needs no change: its
+#      awk test is `$1+0>0`, and +0 forces a decimal read.
+#      Note: [ -gt ] / [ -lt ] compare DECIMALLY, so a clamp such as
+#      "EMA_CAP -lt 100" does NOT see the octal problem - the damage shows up
+#      only where the value reaches $(( )). That is why nnall sits after each
+#      guard block rather than relying on the clamps.
+#  F47 THE COST MODEL AND THE LOCK THRESHOLD WERE FROZEN LITERALS, SO BOTH
+#      INSTRUMENTS LIE AS SOON AS A PROBE KNOB IS RAISED - AND THE GUARD CAN
+#      RUN TWO ROUNDS AT ONCE.
+#      Two symptoms, one cause. Everything below is measured in the sandbox
+#      (pbigcost.sh real wall clock, psteal.sh real lock theft):
+#      (a) --check printed the round ceiling as the literal
+#            check_ceiling_healthy_s=$((5+5+5+6+5+4+4))   = 34
+#            check_ceiling_racing_s=84
+#            check_lock_threshold=480s margin_vs_84s=396s
+#          but SPEED_MAX / SPEED_TRIES / TRY204 / CAND_204_TMO / TOP_PICK are
+#          all conf-tunable and each of them lengthens the round. Measured wall
+#          clock on a conf of 30/20/20/20/10 with fake-curl latency injected:
+#            slp=1  -> 66s   (reported 84)    ok
+#            slp=2  -> 106s  (reported 84)    already past the report
+#            slp=3  -> 189s  (reported 84)    2.3x the report
+#          So the number an operator reads to decide "is my lock threshold big
+#          enough" is unrelated to the round that will actually run. --check
+#          exists to answer exactly that question.
+#      (b) The stale-lock reclaim is `find "$LOCK_DIR" -mmin +8`, a hard 480s.
+#          With the defaults the true ceiling is 84s, so 480s is generous. With
+#          a tuned conf the ceiling reaches 189s (measured) and beyond; the
+#          margin collapses and then inverts. psteal.sh shows the consequence
+#          with the REAL script: start a long round A (max knobs, slp=6), then
+#          move the lock directory's mtime back 9 minutes and start round B.
+#          B reclaims the lock as "stale" while A is still working, and both
+#          rounds run: two "RUN v9.21" banners, two "RACE start", two
+#          "ACT switch [N1] -> [N3]" against ONE state file. That is double
+#          traffic, a doubled budget/cooldown write, and a state race - the
+#          single-instance lock is exactly what must never fail.
+#      Fix: one function, ng_ceiling(), derives the healthy/racing ceilings from
+#      the knobs actually in force, using the formulas verified in
+#      cost_v910.py, and is NORMALISED AGAINST THE SHIPPED DEFAULTS:
+#          racing = 84 + max(0, model(knobs) - model(defaults))
+#      A smaller-than-default knob therefore cannot report a ceiling below the
+#      documented 84s baseline, and the shipped defaults give delta=0, so the
+#      default output is IDENTICAL to every earlier version ("84", "34").
+#      --check prints the derived numbers, the derived lock threshold and the
+#      real margin; the reclaim uses -mmin +ceil(lock_s/60) with
+#      lock_s = max(480, ceiling*3), floored at 8 minutes (so the default path
+#      is unchanged: 84*3=252 < 480 -> 480s -> 8 min) and capped at 1440 min so a
+#      maximal knob set cannot push the threshold into absurdity.
+# ------------------------------------------------------------------------
+# nodeguard.sh v9.20 - a signal handler that did not exit, and a globbing word list
+# Base: v9.19 (2312 lines). All v9.19 (F39/F40) and earlier fixes retained.
+# v9.20 changes (two defects found by the ninth robustness round):
+#  F41 A TERM BEFORE THE RACE LEFT THE ROUND RUNNING WITH NO LOCK. The
+#      single-instance trap installed right after the mkdir lock was
+#        trap 'rmdir "$LOCK_DIR"' EXIT INT TERM HUP
+#      For INT/TERM/HUP it removed the lock and then RETURNED to the interrupted
+#      command instead of exiting, so the round carried on through S3/S4/S5 (and
+#      could issue a PUT) while the single-instance gate was already gone - the
+#      next cron tick then starts a second round beside the first, which is the
+#      exact double-round the mkdir lock exists to prevent.
+#      Sandbox proof (dyn/p41.sh, real trap form): after `kill -TERM`,
+#      "still executing after TERM" + "LOCK GONE (round continues unlocked)".
+#      Fix: the INT/TERM/HUP arm exits (130) after the rmdir; EXIT stays a bare
+#      rmdir for every normal path, and SECTION 6's later on_exit trap replaces
+#      both arms once the race section begins (on_exit restores then exits).
+#  F42 THE FINALIST LOOP GLOBBED NODE NAMES. `for N in $RACE_LIST` is an
+#      UNQUOTED word list, so the shell applies PATHNAME EXPANSION to each word.
+#      IFS=newline stops field splitting on spaces but NOT globbing. A name
+#      containing '*' or a bracket expression gets replaced by the files that
+#      match it in the current directory (a crontab round runs with cwd=/).
+#      Sandbox proof (dyn/p41.sh, busybox ash): with files HK1V1 and N3 in cwd,
+#      the list "HK*V1\nN3" produced the word HK1V1 instead of HK*V1, and a bare
+#      "*" expanded into one word per file - extra phantom candidates plus the
+#      real node silently dropped from the race. Same name-assumption class as
+#      F38/F39.
+#      Fix: `set -f` around the race section (globbing off, newline splitting
+#      unchanged), restored with IFS after the loop.
+# ------------------------------------------------------------------------
+# nodeguard.sh v9.19 - two name/clock assumptions that silently disabled the guard
+# Base: v9.18 (2184 lines). All v9.18 (F38) and earlier fixes retained.
+# v9.19 changes (two defects found by the eighth robustness round):
+#  F39 THE API BODY WAS SPLIT ON EVERY COMMA, SO A NODE NAME CONTAINING A COMMA
+#      MADE EVERY ROUND DIE AT READ_FAIL. Three parse sites used
+#      `tr ',' '\n'` (or `sed 's/"//g' | tr ',' '\n'`) to turn the JSON body
+#      into lines before grepping a field. A comma inside a name -
+#      "JP-01,HK-02", "HK,JP relay", "1,2x rate" - tore that name in half:
+#        * get_now() and the SECTION 2 CUR read returned the truncated head, so
+#          now_ok()/the ledger disagreed with the group's real landing and the
+#          round exited cause=READ_FAIL with nothing measured. Same self-heal
+#          failure mode as F38: the name never changes on its own, so the
+#          monitor stays dead and the operator sees only a quiet log.
+#        * the SECTION 5 delay pool additionally produced a PHANTOM node from
+#          the tail half, i.e. a name that does not exist, and racing it would
+#          PUT a nonexistent name.
+#      Sandbox proof (dyn.sh D37, real body + fake curl, v9.18): node name
+#      "JP-01,HK-02" -> "WARN read selector failed (bad response [JP-01])" ->
+#      cause=READ_FAIL, 0 pass / 2 fail. The same D37 on v9.19 is green.
+#      Fix: never split on commas. Fields are extracted with a single
+#      `grep -o '"now":"[^"]*"'` / `'"type":"[^"]*"'` scan over the WHOLE body
+#      (grep -o does not care about line length, so the tr was never needed),
+#      and the delay pool is parsed by matching `[",]"[^"\\]*":[0-9]+` pairs,
+#      which crosses commas inside a name and still rejects null/nested junk
+#      because the value must be all digits. Verified on the router: whole-body
+#      grep returns "now":"JP-01,HK-02" intact while the tr-split form returns
+#      nothing; comma / colon / space+bracket+rate-tag names all parse.
+#      Unchanged: a name carrying a raw double quote or backslash is still
+#      rejected by now_ok's blacklist (it cannot be encoded safely), and
+#      D38/D39 confirm tag-style names and colon-bearing state self-heal as
+#      before.
+#  F40 A SPIKE STREAK STAMPED IN THE FUTURE WAS TRUSTED FOREVER. spk_read()
+#      expired a streak only when `NOW - ts > SPK_TTL`. A stamp in the future
+#      gives a NEGATIVE age, which is never greater than the TTL, so the streak
+#      survived indefinitely - a clock step, an NTP jump or a hand-written file
+#      could hand an unrelated round a half-earned streak, and EMA_UNSTICK=3
+#      would then re-seed the baseline from one burst (the mirror image of the
+#      F26/F34 ratchet).
+#      Sandbox proof (dyn.sh D40, v9.18): spk="2:9999999999" was consumed and
+#      rewritten ("got 0:... want empty"), i.e. retained rather than dropped.
+#      Fix: an age below zero is unverifiable, so the streak is dropped - the
+#      same rule SUBHEAL already applies to a future-dated subscription stamp
+#      (L877-882: a negative age heals). Verified: D40 is green, and the F35
+#      suite (stale / legacy / carry cases) is unchanged.
+# ------------------------------------------------------------------------
+# nodeguard.sh v9.18 - a name-length assumption that silently stopped the monitor
+# Base: v9.17 (2114 lines). All v9.17 (F36/F37) and earlier fixes retained.
+# v9.18 changes (one defect found by the seventh robustness round):
+#  F38 now_ok() REJECTED ANY NAME OVER 96 BYTES - THE WHOLE ROUND THEN DIED.
+#     now_ok() is the readback sanity gate: SECTION 2 refuses to run when the
+#     group's current selection fails it (READ_FAIL), put_node distrusts the
+#     readback when it fails it, and on_exit gives up on the restore when it
+#     fails it. The 96 limit was written when node names were assumed ASCII,
+#     and the P1 reasoning behind it is about rejecting a multi-KB HTML error
+#     page - 96 was never a safety requirement, just a number that felt
+#     generous.
+#     It is not generous on a real subscription: CJK and emoji are 3-4 bytes
+#     each, so 30 CJK chars = 90 bytes and 31 = 97. Measured live (namelen.sh,
+#     real config): /proxies 32 entries max 24 bytes, /providers/proxies 174
+#     entries max 48 bytes (longest was a Chinese "update the app" hint node).
+#     So today's cap has only a 2x margin, and nothing stops a rename (airport
+#     rate tags, campaign suffixes, emoji badge stacks) from crossing it.
+#     Sandbox proof (dyn/t_name96.sh, real script body, fake curl):
+#       bytes=94  -> ran normally, "OK [LONG...]"
+#       bytes=97  -> "WARN read selector failed ... cause=READ_FAIL" + exit 0
+#       bytes=100 -> same
+#       bytes=106 -> same
+#     i.e. from the first 97-byte name onward EVERY round exits at SECTION 2
+#     before measuring anything. Nothing self-heals: the name does not change
+#     on its own, and the fail counter is not even bumped, so the operator sees
+#     a perfectly quiet log and a node that is never switched away from. One
+#     sibling failure shares the root cause and was proven in the same run:
+#     on_exit could not restore (the `now_ok "$CN" || exit 0` guard), so a TERM
+#     mid-race left the group on a half-tested candidate - the exact situation
+#     on_exit exists to prevent.
+#     RETRACTION: an earlier draft of this note also claimed that a >96-byte
+#     CANDIDATE would be misjudged as "switch rejected (unreadable actual ...
+#     cause=PUT_UNKNOWN)" and could never be raced. That claim is NOT true and
+#     is withdrawn here. put_node() returns before now_ok() whenever the
+#     readback already equals the requested name (the `_pa = _pn` early
+#     return), so a long candidate seats normally. Direct evidence: the same
+#     N06 scenario also PASSES on unpatched v9.17. Only the two sites listed
+#     above (SECTION 2 READ_FAIL and the on_exit guard) were ever broken.
+#     Fix: raise the cap to 256 bytes (5x the measured live max) and demote it
+#     in the comment to what it really is - a sanity bound. The real garbage
+#     filter is the character blacklist below it, which every HTML page fails
+#     on its own because HTML contains '<'. A very long error page is rejected
+#     by the length test, a short one by the blacklist.
+#     Verified (dyn/t_names.sh, N01-N08): v9.18 scores 20 pass / 0 fail. The
+#     identical suite against v9.17 scores 13 pass / 8 fail, and every failure
+#     lands in N02/N03/N04 (READ_FAIL, no bps) or N07 (trap never fired, core
+#     not restored) - so the suite separates the fix from the baseline instead
+#     of merely proving itself.
+#     Failure direction: a loose cap lets a long-but-real name through, which
+#     is correct; the blacklist still rejects anything that could poison enc().
+# ------------------------------------------------------------------------
+# nodeguard.sh v9.17 - a detached refresh that is actually detached
+# Base: v9.16 (2057 lines). All v9.16 (F35) and earlier fixes retained.
+# v9.17 changes (two defects found by the sixth robustness round, both in the
+# F31 subscription self-heal that v9.13 added):
+#  F36 THE "BACKGROUND" REFRESH WAS NOT BACKGROUND - IT BLOCKED THE ROUND.
+#     subheal_check ends with `( ... ) > /dev/null 2>&1 &`. That is a JOB OF THE
+#     ROUND'S SHELL, so every later bare `wait` in the same round catches it:
+#     S3 line 1264, S5 line 1480, S6 line 1825. The F31 design note promises
+#     "never blocks the round: the refresh is backgrounded, the round goes on to
+#     screen/race immediately" - the code did the opposite.
+#     Measured (busybox ash 1.37.0, child replaced by `sleep 8`, real
+#     subheal_check body): round wall time 8.000s for an 8s child, i.e. the
+#     round waited exactly as long as the fetch. In production the fetch is
+#     capped at 120s + retry 3, so a dead CDN - the exact scenario F31b exists
+#     for - could add up to ~67s to a round whose whole budget is 84s.
+#     Fix: double fork. `( ( ... ) & )` puts the refresh in a grandchild that is
+#     not a job of the round's shell, so `wait` returns at once.
+#     Verified: same harness -> round wall 0s with an 8s child; grandchild still
+#     runs to completion (marker file written).
+#  F37 THE DETACHED CHILD INHERITED FD 9, THE F33 DEPLOY LOCK.
+#     F33 makes the round hold flock on /tmp/nodeguard.single for its whole
+#     life. The refresh subshell forked AFTER that, so it inherited the locked
+#     descriptor. On the paths that leave early (GROUP_TYPE at 1214/1215,
+#     READ_FAIL at 1218) the round returns before any `wait`, the trap drops the
+#     mkdir lock, and the still-running orphan keeps the flock: the deploy lock
+#     then belongs to a process nobody is tracking, and the 05:10 selfupdate
+#     backs off against a round that has already finished.
+#     Measured (real subheal_check body, early-exit path, 8s child): after the
+#     round exits, `flock -n` reports HELD, holders = the wrapper shell and its
+#     sleep. It goes FREE only when the child finishes. Thus F36 alone would
+#     have left this live: before the fix the blocking `wait` masked it on the
+#     normal path and made it impossible to observe.
+#     Fix: `exec 9>&-` as the first command of the refresh subshell, and the
+#     same guard on every other background child in the round (S2, S3, S5, S6).
+#     Verified: same harness -> FREE immediately after the early exit, while the
+#     child is still alive.
+#     Note: those other children are reaped by their own `wait` and so cannot
+#     outlive a normal round; the guard is added because a round killed by TERM
+#     between launch and wait would orphan them for up to their curl -m cap, and
+#     the cost is one dup2 in a forked child.
+# ------------------------------------------------------------------------
+# nodeguard.sh v9.16 - make the unstick streak genuinely consecutive
+# Base: v9.15 (1976 lines). All v9.15 (F34) and earlier fixes retained.
+# v9.16 changes (one defect found by the sixth robustness round):
+#  F35 THE F34 STREAK SURVIVED ROUNDS THAT PRODUCED NO SAMPLE. F34 counts
+#     "consecutive rejections" in /var/run/nodeguard.spk so that a one-off
+#     burst cannot move the baseline. But the counter was only written inside
+#     the EMA block, which is guarded by `[ "$BEST_BPS" -gt 0 ]`, and several
+#     round paths return before the EMA block runs at all (API_DOWN,
+#     GROUP_TYPE, READ_FAIL, EXT_CHANGE, precheck/screen early exits). On
+#     those rounds the file kept its old value, so the streak was not
+#     consecutive - it was "however many rejections ever happened".
+#     Measured (sandbox, 2026-11-27, baseline pinned at 16000):
+#       streak=2 -> one round with a dead SPEED_URL (BEST_BPS=0, no write)
+#       -> ONE high sample -> F34 fired and re-seeded the baseline to
+#       467696699B/s. With 3 real bursts (CASE B) the result was identical,
+#       i.e. the extra 2 rejections were never actually observed.
+#     Consequence: a single burst after any skip could plant an absurd
+#     baseline, and every later honest sample would then sit far below it
+#     (the mirror image of F26's ratchet).
+#     Fix: consume-at-start. The streak is read ONCE and immediately zeroed,
+#     right after the single-instance lock is held. A round leaves a nonzero
+#     streak behind only if it actually reached the EMA block (the only writer
+#     of a nonzero value), so every early exit breaks the chain by
+#     construction. A TTL alone was rejected: cron fires every 300s, so a
+#     skipped round inside any TTL wide enough to be useful stays invisible.
+#     The file still carries a TS as a second guard, and legacy bare-number
+#     files (v9.15) are dropped as unverifiable.
+#     Verified: same sandbox - CASE A now stays at 16000 after the single
+#     burst; CASE B (3 consecutive bursts) still re-seeds on the 3rd; CASE C
+#     (single burst, clean streak) still only counts 1/3.
+# ------------------------------------------------------------------------
+# nodeguard.sh v9.15 - unstick the spike baseline (F34)
+# Base: v9.14 (1873 lines). All v9.14 (F32/F33) and earlier fixes retained.
+# v9.15 changes (one defect found by the fifth robustness round):
+#  F34 THE SPIKE BASELINE COULD RATCHET AND NEVER RECOVER. F26 (v9.11) treats
+#     any sample above EMA_SPIKE% (default 300%) of PREV_BPS as a one-off burst
+#     and refuses to move the baseline. That is correct while the baseline is
+#     roughly right, and fatal once it is too low: every honest sample is then
+#     "a burst", so the baseline can never climb. Two ways in were measured on
+#     the live router (2026-11-27):
+#       (a) DOWN DRIFT. EMA_CAP capped an UP step at +25% but nothing capped a
+#           DOWN step, so a run of low samples walked PREV_BPS down without
+#           limit. Measured: PREV_BPS=16393 while the node's 5MB throughput was
+#           180-360KB/s and the 108KB probe read 46-122KB/s (3x the baseline was
+#           49KB, so EVERY sample was rejected). 196 F26 rejections in the log,
+#           baseline never moved once.
+#       (b) the effect. SPIKE_FLAG compares the live sample against that tiny
+#           bar, so a real deceleration of a healthy node is classified "spike
+#           not confirmed" and the switch is suppressed (COOLDOWN_MILD /
+#           SPIKE_WAIT). The guard stays parked on a node it should leave.
+#     Fix (two parts, both additive to F26 - no gate or scoring change):
+#       F34  streak escape: consecutive rejections are counted in
+#            /var/run/nodeguard.spk (tmpfs, NOT a 5th state line - state stays
+#            4 lines). After EMA_UNSTICK (default 3) in a row the sample is
+#            accepted as the new baseline, which proves the old value was a
+#            floor, not a level. A single burst still cannot move it.
+#       F34b clean handover: the streak is zeroed on EXT_CHANGE and on a
+#            confirmed switch, i.e. the two places that already zero PREV_BPS.
+#     Rejected during development: a symmetric DOWN cap on the EMA step. It
+#     looked like the obvious companion fix, but measurement showed it delays a
+#     genuine deceleration ~5x (200000->16000 takes 11 rounds unclamped, 63
+#     clamped) and the streak escape already covers the real failure, so it was
+#     removed rather than shipped as dead weight.
+#     Verified: sandbox replay of the measured state (baseline pinned at 16000,
+#     high samples) - v9.14 keeps the baseline at 16000 for every round; v9.15
+#     re-seeds it on the 3rd consecutive rejection and thereafter tracks samples
+#     normally. Live regression: see section 21.F.
+# ------------------------------------------------------------------------
 # nodeguard.sh v9.14 - visible config failures + one lock domain
 # Base: v9.13 (1800 lines). All v9.13 (F31) and earlier fixes retained.
 # v9.14 changes (two defects found by the R/S robustness rounds):
@@ -492,10 +815,99 @@ API="$NG_API"
 AH="Authorization: $NG_SECRET"
 SEL="$NG_GROUP_SEL"
 
+# F43 (v9.21): A NUMERIC VALUE WITH A LEADING ZERO IS READ AS OCTAL.
+# Every numeric knob and state field is validated with
+#   case "$V" in ''|*[!0-9]*) V=<default> ;; esac
+# which only tests the CHARACTER SET, so "08", "09" and "010" all pass. POSIX
+# arithmetic $(( )) then reads a leading 0 as octal, and 8/9 are not octal
+# digits: $((08+1)) is a FATAL "arithmetic syntax error" and busybox ash aborts
+# the whole script at that line. Under cron stderr is discarded, so the round
+# dies silently with no log line explaining why. A leading-zero value that IS
+# valid octal ("010") is worse in the other direction - it is silently read as
+# 8 instead of 10, so the guard keeps running on a wrong number.
+# Every one of these inputs is reachable without malice: a state file restored
+# from a backup, hand-edited while debugging, produced by an earlier tool, or a
+# conf knob typed as "08" by someone copying a padded value.
+# Measured in sandbox probes p46/p47 against v9.20 (all real rounds, fake curl):
+#   FAIL_N=08 + one mild hit   -> rc=2, log stops after the OK line
+#   RACE_TS=08 (healthy round) -> rc=2, no log line after RUN at all
+#   PREV_BPS=0100000           -> rc=0 but baseline read as octal 32768: the
+#                                 EMA never moves and F26 rejects every sample
+#   --check with RACE_TS=08    -> rc=2, "arithmetic syntax error" on stderr
+# nn() strips leading zeros from an ALREADY-NUMERIC value, in place, with no
+# fork (eval on a literal variable name at every call site). Non-numeric values
+# are left untouched for the case guards, so it must be called AFTER them.
+# "0" is preserved (the loop needs at least two characters to strip).
+nn(){
+  eval "_nv=\${$1}" 2>/dev/null
+  case "$_nv" in ''|*[!0-9]*) return 0 ;; esac
+  _nz=$_nv
+  while :; do case "$_nz" in 0?*) _nz=${_nz#0} ;; *) break ;; esac; done
+  [ "$_nz" = "$_nv" ] || eval "$1=\$_nz" 2>/dev/null
+  return 0
+}
+nnall(){
+  for _k in "$@"; do nn "$_k"; done
+}
+
+# F45 (v9.21): A NUMBER ABOVE THE SHELL'S INTEGER RANGE SILENTLY DISARMS EVERY
+# CLAMP, FLOOR AND GATE - AND CAN MAKE THE GUARD UNSWITCHABLE.
+# The character-set guards above accept any digit string of any length, and a
+# leading-zero strip only shortens it. busybox ash stores integers in 64 bits,
+# so a value >= 2^63 is OUT OF RANGE, and every comparison against it fails in
+# the most dangerous possible direction: it prints "sh: N: out of range" on
+# stderr (which cron throws away) and returns FALSE. So
+#   [ 99999999999999999999 -gt 30720 ] -> false
+#   [ 99999999999999999999 -gt 0 ]     -> false
+# i.e. every "is this value too big / non-zero" test says NO, all floors and
+# clamps do nothing, and the value then reaches $(( )) where it wraps to a
+# NEGATIVE number or garbage. Reachable without malice: a corrupted state file,
+# a restored backup from another tool, a copy-paste of a 20-digit number, a
+# 19-digit epoch from a clock glitch, or a hand-edited conf.
+# Measured in sandbox probe p45d (busybox 1.36 sh):
+#   [ 9223372036854775807 -gt 0 ] -> true   (2^63-1 is the last valid value)
+#   [ 9223372036854775808 -gt 0 ] -> false  + "out of range" on stderr
+#   [ 99999999999999999999 -gt 0 ] -> false + "out of range" on stderr
+#   $(( 9999999999999999999 * 1 )) -> -8446744073709551617   (wrapped negative)
+# Three REAL harms measured on v9.21 with probe pover.sh:
+#   TOP_PICK=99999999999999999999 -> "screen TOP99999999999999999999:" (empty)
+#     and then NO seat and NO ACT switch for the whole round: the guard can never
+#     switch again. Cause: `head -N` rejects the number ("head: invalid number")
+#     and TOPS comes out empty. Control run with TOP_PICK=2 switches normally.
+#   EMA_A=99999999999999999999    -> PREV_BPS persisted as -40075284104017732:
+#     the baseline goes NEGATIVE, which silently disables the F26/F34 spike rule
+#     (every test against a negative baseline fails) and corrupts the next round.
+#   TRY204=99999999999999999999   -> "cur [N1] failed gates (204=999.../999...)"
+#     and FAIL_N accounting goes wrong: cur is judged failed forever.
+# Also measured: `head -4294967295` is the last accepted -N (4294967296 fails),
+# so TOP_PICK additionally needs a much tighter ceiling than the 64-bit one.
+# Fix: nr() = strip leading zeros, then reject anything whose digit LENGTH
+# exceeds the maximum this knob can legitimately have, or whose value exceeds an
+# optional hard ceiling, and put the shipped default back. A rejected value is
+# reset to the DEFAULT (not clamped to the ceiling) on purpose: an absurd value
+# is evidence of corruption, so the safe answer is the known-good behaviour, not
+# a guess at what the operator "meant" by 1e20.
+# Length is tested with ${#var}, which is pure string length - it never goes
+# through integer conversion, so it cannot itself trip the out-of-range trap.
+# nr() is a NO-OP for a value already inside the window, so it can be applied
+# unconditionally and costs no fork (eval on a literal name).
+nr(){
+  nn "$1"
+  eval "_nv=\"\${$1}\"" 2>/dev/null
+  case "$_nv" in
+    ''|*[!0-9]*) eval "$1=\"\$3\"" 2>/dev/null; return 0 ;;
+  esac
+  if [ ${#_nv} -gt "${2:-9}" ]; then eval "$1=\"\$3\"" 2>/dev/null; return 0; fi
+  if [ -n "${4:-}" ] && [ "$_nv" -gt "$4" ]; then eval "$1=\"\$3\"" 2>/dev/null; return 0; fi
+  return 0
+}
+# nrall cannot carry a per-knob window in one flat list, so call sites use nr
+# directly with an explicit (maxlen, default [, ceiling]) triple.
+
 # V6 (v9.9): single version constant - the per-round log prints this.
 # (v9.6 F14 shipped logging "v9.3": a literal at the log site is how
 # that happens. The mihomo version keeps its own name NG_VER.)
-NG_VERSION=v9.14
+NG_VERSION=v9.21
 
 # v9 tunables (override in conf)
 WIN_SEC=${WIN_SEC:-900}          # mild-anomaly window: 2 hits inside window
@@ -516,12 +928,27 @@ TRY204=${TRY204:-3}              # 204 probes per candidate (success gate)
 # strictly worse than a bad gate. Clamp it to >=1: one probe is the smallest
 # meaningful gate and the loop/gate/score all stay well defined.
 case "$TRY204" in ''|*[!0-9]*) TRY204=3 ;; esac
+# F43: strip leading zeros BEFORE the first $(( )) that touches TRY204 - the
+# clamp two lines down already divides/uses it arithmetically, so "08" would
+# abort the round here rather than later.
+nn TRY204
+# F45: TRY204 is a DIVISOR *and* a gate. An out-of-range value makes every
+# comparison against it false, so the LOSS gate fails OPEN (loss is never
+# "> LOSS_MAX") and the score maths runs on garbage. Cap at 3 digits (999
+# probes is already absurd); a longer value is corruption -> default 3.
+nr TRY204 3 3
 [ "$TRY204" -lt 1 ] && TRY204=1
 # F24 (v9.11): how many 204 misses a seat may absorb. 0 = v9.10's all-204 rule
 # (bit-identical default); raise to 1..TRY204-1 to let a near-clean node seat
 # with a non-zero LOSS share recorded (mihomo confidence spirit).
 LOSS_MAX=${LOSS_MAX:-0}
 case "$LOSS_MAX" in ''|*[!0-9]*) LOSS_MAX=0 ;; esac
+nn LOSS_MAX
+# F45: LOSS_MAX is compared against TRY204 and then subtracted inside $(( )).
+# Out of range -> both tests say false, so "[ LOSS_MAX -ge TRY204 ]" never clamps
+# and LOSS_MAX keeps a 20-digit value that later wrappers produce garbage.
+# 3 digits, same scale as TRY204; anything longer is corruption -> default 0.
+nr LOSS_MAX 3 0
 [ "$LOSS_MAX" -ge "$TRY204" ] && LOSS_MAX=$(( TRY204 - 1 ))
 [ "$LOSS_MAX" -lt 0 ] && LOSS_MAX=0
 CAND_204_TMO=${CAND_204_TMO:-2}
@@ -541,6 +968,9 @@ case "$W_LAT"  in ''|*[!0-9]*) W_LAT=30  ;; esac
 case "$W_THR"  in ''|*[!0-9]*) W_THR=60  ;; esac
 case "$W_STAB" in ''|*[!0-9]*) W_STAB=10 ;; esac
 case "$W_JIT"  in ''|*[!0-9]*) W_JIT=15  ;; esac
+# F43 (v9.21): the sum on the next line is a $(( )), so W_*=08 would abort the
+# round right here, before any traffic. Strip after the guards, before the sum.
+nnall W_LAT W_THR W_STAB W_JIT
 if [ $(( W_LAT + W_THR + W_STAB + W_JIT )) -eq 0 ]; then
   W_LAT=30; W_THR=60; W_STAB=10; W_JIT=15
 fi
@@ -548,12 +978,30 @@ fi
 EMA_A=${EMA_A:-80}               # old-sample weight in percent (0.8 -> 80)
 EMA_CAP=${EMA_CAP:-125}          # up-step cap in percent (1.25 -> 125)
 EMA_SPIKE=${EMA_SPIKE:-300}      # sample above old*this%% is a spike, ignored
+EMA_UNSTICK=${EMA_UNSTICK:-3}    # F34: consecutive rejections before re-seed
+# F35 (v9.16): a streak is only meaningful while it is CONSECUTIVE, so the
+# counter file carries its own timestamp. A streak older than SPK_TTL seconds
+# (default 450 = 1.5 cron intervals of 300s) is discarded instead of being
+# carried across skipped / crashed rounds. See the header block for the
+# measurement that motivated this.
+SPK_TTL=${SPK_TTL:-450}
 # v9.11: EMA_A doubles as a WEIGHT, so a value above 100 makes the blend
 # extrapolate backwards - the new sample gets a NEGATIVE weight and a fast node
 # would push the baseline DOWN, manufacturing a fake spike next round. Clamp to
 # the meaningful range 0..100 (non-numeric values are re-guarded at the use site
 # too, so an old conf with garbage still degrades to the default).
 case "$EMA_A" in ''|*[!0-9]*) EMA_A=80 ;; esac
+# F43 (v9.21): EMA_A/EMA_CAP/EMA_SPIKE are multiplied inside $(( )) later, and
+# "$(( PREV_BPS * EMA_SPIKE / 100 ))" with EMA_SPIKE=0300 would abort the round.
+# Strip here, before any of the three clamps: nn() is a no-op on a non-numeric
+# value, so EMA_CAP/EMA_SPIKE still get their own character-set guard a few
+# lines down and a garbage value is replaced by the default there as before.
+nnall EMA_A EMA_CAP EMA_SPIKE
+# F45: EMA_A is a WEIGHT in the blend (see the clamp directly below), so an
+# out-of-range value made the clamp "EMA_A -gt 100" false and the multiplication
+# wrapped the baseline NEGATIVE (measured: PREV_BPS=-40075284104017732). 3 digits
+# is enough for the meaningful 0..100 window; the clamp right below trims >100.
+nr EMA_A 3 80
 [ "$EMA_A" -gt 100 ] && EMA_A=100
 # v9.11 r1: EMA_CAP is an UP-ONLY cap, so a value below 100 silently turns it
 # into a DOWN step. Worked example (verified in the sandbox): PREV=30000 and a
@@ -565,8 +1013,12 @@ case "$EMA_A" in ''|*[!0-9]*) EMA_A=80 ;; esac
 # ordinary sample as a spike and freezes the baseline forever, so it gets the
 # same floor.
 case "$EMA_CAP"   in ''|*[!0-9]*) EMA_CAP=125   ;; esac
+# F45: both are multiplied into $(( )) against the baseline. Out of range -> the
+# "EMA_CAP -lt 100" floor is false, the cap never lifts, and the product wraps.
+nr EMA_CAP 3 125
 [ "$EMA_CAP" -lt 100 ] && EMA_CAP=100
 case "$EMA_SPIKE" in ''|*[!0-9]*) EMA_SPIKE=300 ;; esac
+nr EMA_SPIKE 3 300
 [ "$EMA_SPIKE" -lt 100 ] && EMA_SPIKE=100
 # v9.11 r1: the remaining numeric knobs were guarded only implicitly (a
 # non-numeric value makes [ -lt ] fail silently). That is mostly harmless, but
@@ -590,6 +1042,53 @@ case "$SPEED_MAX"      in ''|*[!0-9]*) SPEED_MAX=4      ;; esac
 case "$SPEED_TRIES"    in ''|*[!0-9]*) SPEED_TRIES=2    ;; esac
 case "$CAND_204_TMO"   in ''|*[!0-9]*) CAND_204_TMO=2   ;; esac
 case "$SPIKE_PCT"      in ''|*[!0-9]*) SPIKE_PCT=20     ;; esac
+# F43 (v9.21): every knob above has now passed its CHARACTER-SET guard, so a
+# leading zero can be stripped safely (a non-numeric value would be left alone
+# by nn() and would have been replaced by the default one line earlier anyway).
+# This is the single point that matters for the conf side: the floors below and
+# every $(( )) later in the file then see plain decimal. Measured on v9.20
+# (p46/p47): TRY204=08 aborted a racing round with "arithmetic syntax error",
+# RACE_CD=08 / THRESH_BPS=030000 were silently misread as octal.
+nnall WIN_SEC FAIL_TRIGGER RACE_CD RACE_BUDGET_H RACE_BUDGET_WIN TOP_PICK \
+      TIE_PCT THRESH_BPS SEVERE_BPS SPEED_MAX SPEED_TRIES CAND_204_TMO \
+      SPIKE_PCT TRY204 LOSS_MAX W_LAT W_THR W_STAB W_JIT \
+      EMA_UNSTICK SPK_TTL
+# F45 (v9.21): leading zeros fixed one class of bad number; a value ABOVE 2^63 is
+# the other. nr() applies the same window to every remaining knob with a length
+# ceiling chosen from what the knob can physically mean (all times are seconds,
+# all rates are B/s, all percentages are 0..100-ish). A value that fails the
+# window is replaced by the shipped default - see the F45 block at nr() for the
+# three measured harms this prevents.
+#   seconds  (<= 8 digits  = 3.1 years) : WIN_SEC RACE_CD RACE_BUDGET_WIN
+#   counters (<= 5 digits)              : FAIL_TRIGGER RACE_BUDGET_H SPK_TTL
+#   pool     (<= 3 digits)              : TOP_PICK
+#   percent  (<= 3 digits)              : TIE_PCT SPIKE_PCT EMA_A EMA_CAP
+#                                         EMA_SPIKE EMA_UNSTICK
+#   rate     (<= 8 digits)              : THRESH_BPS SEVERE_BPS
+#   probes   (<= 3 digits)              : SPEED_MAX SPEED_TRIES CAND_204_TMO
+#   weights  (<= 5 digits)              : W_LAT W_THR W_STAB W_JIT
+nr WIN_SEC            8 900
+nr FAIL_TRIGGER       5 2
+nr RACE_CD            8 900
+nr RACE_BUDGET_H      5 2
+nr RACE_BUDGET_WIN    8 3600
+# TOP_PICK also reaches `head -N`, and busybox head rejects anything past
+# 4294967295 (measured: 4294967295 ok, 4294967296 "invalid number"). 3 digits is
+# far below that and far above any real selector pool.
+nr TOP_PICK           3 2
+nr TIE_PCT            3 20
+nr THRESH_BPS         8 30720
+nr SEVERE_BPS         8 15360
+nr SPEED_MAX          3 4
+nr SPEED_TRIES        3 2
+nr CAND_204_TMO       3 2
+nr SPIKE_PCT          3 20
+nr W_LAT              5 30
+nr W_THR              5 60
+nr W_STAB             5 10
+nr W_JIT              5 15
+nr EMA_UNSTICK        3 3
+nr SPK_TTL            5 450
 [ "$TOP_PICK" -lt 1 ]    && TOP_PICK=1
 [ "$SPEED_TRIES" -lt 1 ] && SPEED_TRIES=1
 [ "$SPEED_MAX" -lt 1 ]   && SPEED_MAX=1
@@ -679,6 +1178,20 @@ case "$NG_SUBHEAL_OK_WIN"    in ''|*[!0-9]*) NG_SUBHEAL_OK_WIN=21600 ;; esac
 case "$NG_SUBHEAL_STALE_MIN" in ''|*[!0-9]*) NG_SUBHEAL_STALE_MIN=10 ;; esac
 case "$NG_SUBHEAL_MIN_WAIT"  in ''|*[!0-9]*) NG_SUBHEAL_MIN_WAIT=900 ;; esac
 case "$NG_SUBHEAL_MAX_WAIT"  in ''|*[!0-9]*) NG_SUBHEAL_MAX_WAIT=21600 ;; esac
+# F43 (v9.21): NG_SUBHEAL_MIN_WAIT is the seed for the backoff doubling, whose
+# next step is _wait=$(( sh_cur * 2 )) inside the detached child. "0900" here
+# would abort that CHILD (a silent dead heal) rather than the round, so it is
+# the same defect with a quieter symptom.
+nnall NG_SUBHEAL_OK_WIN NG_SUBHEAL_STALE_MIN NG_SUBHEAL_MIN_WAIT NG_SUBHEAL_MAX_WAIT
+# F45 (v9.21): the backoff step is _wait=$(( sh_cur * 2 )) and the seed is
+# NG_SUBHEAL_MIN_WAIT. An out-of-range seed makes "wait < MIN" false (so the
+# floor never applies) and the doubling then wraps NEGATIVE - the heal would
+# either storm or stall silently, in a detached child whose stderr is discarded.
+# All four are seconds/minutes: 8 digits is already ~3 years.
+nr NG_SUBHEAL_OK_WIN    8 21600
+nr NG_SUBHEAL_STALE_MIN 5 10
+nr NG_SUBHEAL_MIN_WAIT  8 900
+nr NG_SUBHEAL_MAX_WAIT  8 21600
 [ "$NG_SUBHEAL_MIN_WAIT" -lt 300 ] && NG_SUBHEAL_MIN_WAIT=300
 [ "$NG_SUBHEAL_MAX_WAIT" -lt "$NG_SUBHEAL_MIN_WAIT" ] && NG_SUBHEAL_MAX_WAIT=$NG_SUBHEAL_MIN_WAIT
 # subheal_check: logs one line and, if needed, starts the detached refresh.
@@ -750,6 +1263,17 @@ subheal_check(){
       ''|*[!0-9]*) rm -f "$SUBHEAL_BACKOFF" 2>/dev/null; sh_next=0 ;;
     esac
     case "${sh_cur:-x}" in ''|*[!0-9]*) sh_cur=$NG_SUBHEAL_MIN_WAIT ;; esac
+    # F43 (v9.21): the backoff file is plain text in tmpfs and survives a crash,
+    # so "0900" is reachable. sh_cur is later doubled inside $(( )), which would
+    # abort the detached heal child on an 8/9 digit.
+    nnall sh_next sh_cur
+    # F45: sh_cur is doubled in $(( )) inside the detached child. Out of range
+    # makes the MIN/MAX clamps below false, and the doubled value wraps, so the
+    # backoff file gets a negative next-retry and the heal either storms or
+    # never retries. 8 digits is ~3 years of seconds: anything longer is a
+    # hand-planted or corrupted file, so re-seed from the conf default.
+    nr sh_next 10 0
+    nr sh_cur  8 "$NG_SUBHEAL_MIN_WAIT"
     if [ "$sh_next" -gt 0 ] && [ "$(date +%s)" -lt "$sh_next" ]; then
       sh_hold=1
     fi
@@ -760,7 +1284,18 @@ subheal_check(){
     return 0
   fi
   log "SUBHEAL subscription [$sh_id] success=[${sh_ok:-missing}] update=[${sh_upd:-none}] -> refresh in background"
-  (
+  # F36b/F37: DOUBLE fork. A plain `( ... ) &` is a JOB OF THIS SHELL, so every
+  # later bare `wait` in the round (S3 line 1253, S5 line 1465, S6 line 1809)
+  # waits for it - measured 8s/8s, i.e. the "never blocks the round" promise was
+  # false and a dead CDN could add ~67s to a round it was supposed to be
+  # independent of. Wrapping it in a second subshell detaches it from this
+  # shell's job table; the inner block replaces the old body unchanged.
+  ( (
+    # F36a: the child would inherit fd 9, the flock this round holds for its
+    # whole life (F33). On an early-exit path the round returns before any
+    # `wait`, so the orphan held /tmp/nodeguard.single past the round's death
+    # and the 05:10 selfupdate saw a lock nobody owned. Release it here.
+    exec 9>&- 2>/dev/null
     trap 'rm -rf "$SUBHEAL_LOCK" 2>/dev/null' EXIT INT TERM HUP
     /etc/init.d/nikki update_subscription "$sh_id" > /dev/null 2>&1
     _s=$(uci -q get "nikki.$sh_id.success" 2>/dev/null)
@@ -777,7 +1312,7 @@ subheal_check(){
       [ "$_wait" -gt "$NG_SUBHEAL_MAX_WAIT" ] && _wait=$NG_SUBHEAL_MAX_WAIT
       echo "$(( $(date +%s) + _wait )) $_wait" > "$SUBHEAL_BACKOFF" 2>/dev/null
     fi
-  ) > /dev/null 2>&1 &
+  ) > /dev/null 2>&1 & ) > /dev/null 2>&1
 }
 # log trim (v8.1 rule: 200KB cap). F15: keep last 400 lines instead of
 # 100 - a round writes 5-15 lines, so 100 lines only covered ~10-30 rounds
@@ -791,7 +1326,17 @@ subheal_check(){
 
 # ---- helpers ----
 enc(){ printf "%s" "$1" | awk 'BEGIN{for(i=0;i<256;i++)o[sprintf("%c",i)]=i}{n=length($0);for(i=1;i<=n;i++){c=substr($0,i,1);if(c~/[A-Za-z0-9._~-]/)printf"%s",c;else printf"%%%02X",o[c]}}'; }
-get_now(){ curl -s -m 3 -H "$AH" "$API/proxies/$(enc "$SEL")" | tr ',' '\n' | grep -o '"now":"[^"]*"' | head -n1 | sed 's/^"now":"//; s/"$//'; }
+# F39 (v9.19): NO tr ',' '\n' here. The old form tore the JSON body on every
+# comma to make grep line-oriented, but a node name may itself contain a comma
+# ("JP-01,HK-02", "HK,JP relay", "1,2x rate"). Then "now":"JP-01,HK-02" is split
+# into '"now":"JP-01' + 'HK-02"' and grep -o can only return the truncated head,
+# so the readback disagrees with the name we asked for and every round ends in
+# READ_FAIL - the same class as F38 (a name assumption, not a safety limit),
+# measured in sandbox D37 (0 pass / 2 fail on v9.18). grep -o works on one long
+# line as well as on many short ones, so the tr was never needed. Verified on
+# the router: whole-body grep returns "now":"JP-01,HK-02" intact, tr-split
+# returns nothing.
+get_now(){ curl -s -m 3 -H "$AH" "$API/proxies/$(enc "$SEL")" | grep -o '"now":"[^"]*"' | head -n1 | sed 's/^"now":"//; s/"$//'; }
 # F1: exact JSON field parse replaces greedy sed. Verified live: an HTML
 # 502 page, {"error":...}, {"now":""} all yield an empty string now.
 # Keep a defensive blacklist on top (defense in depth): a truncated JSON with
@@ -800,9 +1345,28 @@ get_now(){ curl -s -m 3 -H "$AH" "$API/proxies/$(enc "$SEL")" | tr ',' '\n' | gr
 # quoted-quote, single-quote, backslash, brace, angle and backtick patterns all
 # match; normal names with spaces / CJK / pipes / hyphens still pass.
 # NOTE: spaces must stay legal - real node names contain them.
+# F38 (v9.18): the byte cap was 96, which was sized as if a name were ASCII.
+# Real airport names carry emoji, CJK and rate tags, and 30 CJK chars are
+# already 90 bytes, so a 31-char CJK name is 97 bytes. Measured live max on
+# this subscription was 48 bytes (174 provider entries + 32 /proxies entries),
+# so the cap had only a 2x margin and nothing guarantees a rename stays under
+# it. Sandbox proof (t_name96.sh): a 97-byte name made SECTION 2 log
+# READ_FAIL and exit 0 - the monitor stopped EVERY round with no self-
+# recovery, and on_exit's restore read the same name as unreadable and
+# returned without restoring, so a TERM mid-race could leave the group on a
+# half-tested candidate. Both are the same root cause: 96 was a name-length
+# assumption, not a safety limit.
+# (A third claim - that a >96-byte candidate was misfiled as PUT_UNKNOWN and
+# could never be raced - is WRONG and withdrawn: put_node returns before this
+# gate when the readback already equals the requested name, so a long
+# candidate seats normally. The same scenario passes on unpatched v9.17.)
+# 256 keeps a 5x margin over the measured live max and still rejects a
+# multi-KB HTML error page, which the blacklist below also rejects on its own
+# (every HTML page contains '<'). The length test is a saneness bound, not the
+# primary garbage filter - the character blacklist is.
 now_ok(){
   [ -z "$1" ] && return 1
-  [ "${#1}" -gt 96 ] && return 1
+  [ "${#1}" -gt 256 ] && return 1
   case "$1" in *'"'*|*"'"*|*'\'*|*'{'*|*'}'*|*'<'*|*'>'*|*'`'*) return 1 ;; esac
   return 0
 }
@@ -878,6 +1442,61 @@ speed_med(){
 }
 
 # ============================================================
+# F47 (v9.21): the round ceiling is DERIVED from the knobs in force.
+# ------------------------------------------------------------
+# The old --check numbers were literals (34 / 84 / 480s margin 396s) that only
+# held for the shipped defaults. SPEED_MAX, SPEED_TRIES, TRY204, CAND_204_TMO and
+# TOP_PICK are all conf-tunable and all lengthen the round, so with a tuned conf
+# the report described a round that is not the one that runs (measured 106s and
+# 189s of real wall clock against a reported 84s, see the F47 header block).
+# The same constants also drive the stale-lock reclaim, which is the dangerous
+# half: once the true ceiling passes the 480s threshold the next cron tick can
+# reclaim a live lock and two rounds run at once.
+#
+# Formula, taken from 35_yanzheng/cost_v910.py (the authority for 84/34) and
+# generalised over the knobs. NORMALISED AGAINST THE DEFAULTS:
+#   per_cand = TRY204*CAND_204_TMO + max(6, SPEED_TRIES*SPEED_MAX) + 8
+#   s3       = max(6, CAND_204_TMO, SPEED_MAX) + SPEED_MAX
+#   racing   = 84 + max(0, s3-10) + TOP_PICK*max(0, per_cand-22)
+#              + max(0, TOP_PICK-2)*22
+#   healthy  = 34 + max(0, s3-10) + max(0, SPEED_TRIES*SPEED_MAX-8)
+# With the shipped defaults every delta is 0, so the reported numbers are
+# EXACTLY the historical 34 / 84 - existing documents and tests stay valid.
+# Each max(0, .) term keeps a BELOW-default knob from reporting a ceiling under
+# the documented baseline: the baseline is a real measurement, not a guess, and
+# shrinking the report below it would be a new lie in the other direction.
+# An upper clamp of 86400s (a day) keeps a maximal knob set (all 3-digit) from
+# printing an absurd number; the lock minutes then clamp separately at 1440.
+# Wall clock per section is the worst case where every request times out, so the
+# result is an upper bound by construction.
+# Output: NG_HEALTHY, NG_RACING, NG_LOCK_S, NG_LOCK_MIN.
+ng_ceiling(){
+  _g=6
+  _sp=$(( SPEED_TRIES * SPEED_MAX ))
+  _cm=$(( TRY204 * CAND_204_TMO ))
+  _hi="$_sp"; [ "$_g" -gt "$_hi" ] && _hi=$_g
+  _pc=$(( _cm + _hi + 8 ))            # per-candidate worst case, ship defaults 22
+  _mx="$CAND_204_TMO"
+  [ "$SPEED_MAX" -gt "$_mx" ] && _mx=$SPEED_MAX
+  [ "$_g" -gt "$_mx" ]        && _mx=$_g
+  _s3=$(( _mx + SPEED_MAX ))          # ship defaults 10
+  _d_s3=$(( _s3 - 10 ));      [ "$_d_s3" -lt 0 ] && _d_s3=0
+  _d_cand=$(( _pc - 22 ));    [ "$_d_cand" -lt 0 ] && _d_cand=0
+  _d_pool=$(( TOP_PICK - 2 )); [ "$_d_pool" -lt 0 ] && _d_pool=0
+  _d_sp=$(( _sp - 8 ));       [ "$_d_sp" -lt 0 ] && _d_sp=0
+  NG_RACING=$(( 84 + _d_s3 + _d_cand * TOP_PICK + _d_pool * 22 ))
+  NG_HEALTHY=$(( 34 + _d_s3 + _d_sp ))
+  [ "$NG_RACING" -gt 86400 ] && NG_RACING=86400
+  NG_LOCK_S=$(( NG_RACING * 3 ))
+  [ "$NG_LOCK_S" -lt 480 ] && NG_LOCK_S=480
+  NG_LOCK_MIN=$(( (NG_LOCK_S + 59) / 60 ))
+  [ "$NG_LOCK_MIN" -lt 8 ]    && NG_LOCK_MIN=8
+  [ "$NG_LOCK_MIN" -gt 1440 ] && NG_LOCK_MIN=1440
+  return 0
+}
+ng_ceiling
+
+# ============================================================
 # V3 (v9.9): read-only self-check, BEFORE the lock and before any write
 # ============================================================
 # Trigger: NG_CHECK=1 in the environment, or a bare "--check" argv.
@@ -935,23 +1554,46 @@ if [ "$NG_CHECK" = "1" ]; then
     case "$CFAIL" in ''|*[!0-9]*) CFAIL=0 ;; esac
     case "$CRACE" in ''|*[!0-9]*) CRACE=0 ;; esac
     case "$CTS"   in ''|*[!0-9]*) CTS=0 ;; esac
+    # F43 (v9.21): $((CNOW-CRACE)) below aborts with "arithmetic syntax error"
+    # on a leading zero - measured on v9.20 with RACE_TS=08: rc=2 and --check
+    # printed no verdict at all (p46), which reads as "--check is broken".
+    nnall CFAIL CTS CRACE
+    # F45 (v9.21): an out-of-range stamp makes "CRACE -gt 0" FALSE, so the report
+    # claims "not cooling down" while the round would still see a cooldown (or
+    # vice versa) - the diagnostic lies in the exact situation it is consulted
+    # for. Both stamps are epochs (10 digits); CFAIL is a small counter.
+    nr CFAIL 5 0
+    nr CTS   10 0
+    nr CRACE 10 0
     echo "check_state_file=present"
   else
     echo "check_state_file=absent (first run would initialise it)"
   fi
   CNOW=$(date +%s)
+  # F46 (v9.21): same future-stamp policy as the round path - a stamp ahead of
+  # now is not evidence about the past, so it is ignored here too. Otherwise the
+  # report would claim a cooldown the round no longer respects (or, for
+  # RTS_LOG, a budget that never expires), i.e. the diagnostic would disagree
+  # with the behaviour precisely when an operator consults it.
+  [ "$CRACE" -gt 0 ] && [ "$CRACE" -gt "$CNOW" ] && CRACE=0
+  [ "$CTS"   -gt 0 ] && [ "$CTS"   -gt "$CNOW" ] && { CFAIL=0; CTS=0; }
   if [ "$CRACE" -gt 0 ] && [ $((CNOW-CRACE)) -lt "$RACE_CD" ]; then
     echo "check_cooldown_remaining=$((RACE_CD-(CNOW-CRACE)))s of ${RACE_CD}s"
   else
     echo "check_cooldown_remaining=0s (not cooling down)"
   fi
-  CREC=$(printf '%s' "$CRTS" | tr ',' '\n' | awk -v now="$CNOW" -v w="$RACE_BUDGET_WIN" '$1+0>0 && now-$1<w' | grep -c .)
+  CREC=$(printf '%s' "$CRTS" | tr ',' '\n' | awk -v now="$CNOW" -v w="$RACE_BUDGET_WIN" '$1+0>0 && $1+0<=now && now-$1<w' | grep -c .)
   echo "check_budget_used=${CREC:-0}/${RACE_BUDGET_H} in ${RACE_BUDGET_WIN}s"
   echo "check_fail_counter=$CFAIL/${FAIL_TRIGGER}"
-  # -- static cost model, derived from this file's own -m constants --
-  echo "check_ceiling_healthy_s=$((5+5+5+6+5+4+4))"
-  echo "check_ceiling_racing_s=84 (v9.12: F30 dropped the serial /proxies refetch; parallel S5 already produced that data)"
-  echo "check_lock_threshold=480s margin_vs_84s=$((480-84))s"
+  # -- static cost model, derived from the knobs in force (F47) --
+  # These were the literals 34 / 84 / 480s before v9.21: correct only for the
+  # shipped defaults, wrong for every tuned conf that lengthens the round (real
+  # wall clock measured 66s / 106s / 189s against the printed 84s). ng_ceiling()
+  # derives them from SPEED_MAX, SPEED_TRIES, TRY204, CAND_204_TMO, TOP_PICK and
+  # is normalised against the defaults, so the default output is unchanged.
+  echo "check_ceiling_healthy_s=$NG_HEALTHY"
+  echo "check_ceiling_racing_s=$NG_RACING (derived from SPEED_MAX=$SPEED_MAX SPEED_TRIES=$SPEED_TRIES TRY204=$TRY204 CAND_204_TMO=$CAND_204_TMO TOP_PICK=$TOP_PICK; default conf -> 84)"
+  echo "check_lock_threshold=${NG_LOCK_S}s (${NG_LOCK_MIN}min) margin_vs_ceiling=$((NG_LOCK_S-NG_RACING))s"
   # -- optional deep probe: ONE raw group-delay call --
   if [ "${NG_CHECK_DEEP:-0}" = "1" ]; then
     CDJ=$(curl -s -m 30 -H "$AH" "$API/group/$(enc "$SEL")/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=3000" 2>/dev/null)
@@ -970,22 +1612,19 @@ if [ "$NG_CHECK" = "1" ]; then
   exit 0
 fi
 
-# ---- single instance lock (mkdir + stale guard > 8min) ----
-# S1: the original justification put the worst-case round at ~265s
-# (4.4min) > the old 4min threshold, so a slow-but-alive round could be
-# stolen by the next cron tick. Neither 265s nor the 360s v9.8 figure is
-# reproducible (mutually exclusive paths added); the v9.9-corrected
-# racing ceiling was 281s (4.7min), still > 4min, so 8min remained
-# correct with 199s of margin. v9.10 (scheme B) trims the all-timeout
-# ceiling to 94s (cost_v910.py), v9.12 F30 to 84s; margin 480-84=396s,
-# so 8min holds with far more headroom.
-# S3: stale cleanup must run EVEN when mkdir fails. Old code exited on
-# mkdir failure (old v9.3 exited here), so a stale lock (left by a crashed round) made
-# every later round "SKIP another instance" forever, and the -mmin +8
-# cleanup below was NEVER reached. Now: mkdir fails -> still check stale
-# -> reclaim if old enough -> only then give up.
+# ---- single instance lock (mkdir + stale guard) ----
+# F47 (v9.21): the stale threshold used to be the literal "-mmin +8" (480s).
+# That is only safe while the true ceiling is 84s. The threshold is now DERIVED
+# (ng_ceiling): lock_s = max(480, ceiling*3), minutes rounded up, floored at 8
+# and capped at 1440. Shipped defaults: 84*3=252 < 480 -> 480s -> 8 min, i.e.
+# the old behaviour, bit for bit. A tuned conf that lengthens the round raises
+# the threshold with it, which is what keeps a live round from being reclaimed.
+# Measured harm it prevents (psteal.sh, real script): a long round with maximal
+# knobs had its lock directory back-dated by 9 minutes, the next round reclaimed
+# it as "stale" and BOTH rounds ran - two RUN banners, two RACE start lines, two
+# ACT switch lines against one state file.
 if ! mkdir "$LOCK_DIR" 2> /dev/null; then
-  if [ -n "$(find "$LOCK_DIR" -mmin +8 2>/dev/null)" ]; then
+  if [ -n "$(find "$LOCK_DIR" -mmin +"$NG_LOCK_MIN" 2>/dev/null)" ]; then
     rm -rf "$LOCK_DIR" 2>/dev/null
     mkdir "$LOCK_DIR" 2>/dev/null || { log "SKIP lock contention after stale reclaim"; exit 0; }
   else
@@ -993,7 +1632,22 @@ if ! mkdir "$LOCK_DIR" 2> /dev/null; then
     exit 0
   fi
 fi
-trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT INT TERM HUP
+trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+# F41 (v9.19): a TERM/INT/HUP that arrives BEFORE SECTION 6 installs its
+# on_exit trap must END the round. The old single trap
+#   trap 'rmdir "$LOCK_DIR"' EXIT INT TERM HUP
+# ran the rmdir and then RETURNED, so the shell simply carried on with the rest
+# of the script: measured in sandbox probe (p41b) - "B: still executing after
+# TERM" / "B: LOCK GONE (round continues unlocked)". Two consequences, both
+# real: (a) the round kept doing S3/S4/S5 traffic and could even reach a PUT
+# after being told to stop; (b) the single-instance gate was already gone, so
+# the next cron tick could start a SECOND round while the first was alive -
+# exactly the double-round the mkdir lock exists to prevent, and the reason
+# `trap` must exit. exit 130 keeps it distinguishable from a normal 0.
+# The EXIT arm above still covers every normal path, and SECTION 6's later
+# `trap 'on_exit' EXIT INT TERM HUP` replaces both arms once the race starts
+# (on_exit does its own restore and exits).
+trap 'rmdir "$LOCK_DIR" 2>/dev/null; exit 130' INT TERM HUP
 # F33: take the SAME flock the daily selfupdate deploy guard uses, for the
 # whole round. selfupdate (/root/selfupdate.sh) runs `flock -n
 # /tmp/nodeguard.single` and backs off when it is held - but until v9.14 this
@@ -1002,9 +1656,32 @@ trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT INT TERM HUP
 # here makes both guards share one lock domain. If flock is not installed the
 # redirect fails harmlessly (fd 9 on /dev/null) and the mkdir lock above is
 # still the single-instance gate.
+# F44 (v9.21): THE LOCK OPEN ITSELF MUST NOT BE ABLE TO KILL THE ROUND.
+# `exec 9>>FILE` is a SPECIAL BUILTIN: when the redirect cannot be performed
+# busybox ash terminates the shell right there, before any later line runs.
+# Measured in sandbox probe pfd: `exec 9>>/nonexistent_dir/f` -> the script ends
+# with rc=1 and nothing after it executes; a plain `echo x >>file` in the same
+# position merely fails. Under cron stderr is discarded, so the round VANISHES
+# with no banner, no SKIP line and no log entry - it looks exactly like cron
+# never fired, which is the worst possible failure shape for a silent guard.
+# Reachable whenever NG_FLOCK points into a directory that does not exist (a
+# conf typo, an init.d that was supposed to mkdir it), or when the tmpfs holding
+# it is full or read-only. The mkdir lock above is already held, so the safe
+# behaviour is: probe the open in a SUBSHELL (a dying subshell cannot kill us),
+# and only exec on the main shell when the probe proved the file is openable.
 NG_FLOCK="${NG_FLOCK:-/tmp/nodeguard.single}"
+FLOCK_FD=0
 if command -v flock >/dev/null 2>&1; then
-  exec 9>>"$NG_FLOCK" 2>/dev/null
+  # The probe opens the real file (>> creates it) and closes it on subshell
+  # exit, so a successful probe leaves no lock held and no state behind.
+  if ( exec 9>>"$NG_FLOCK" ) 2>/dev/null; then
+    exec 9>>"$NG_FLOCK" 2>/dev/null || FLOCK_FD=0
+    FLOCK_FD=1
+  else
+    FLOCK_FD=0
+  fi
+fi
+if [ "$FLOCK_FD" = "1" ]; then
   # Not fatal on contention here: the mkdir lock above already proved we are
   # the single round, so a held flock can only mean a deploy is in flight;
   # wait for it (bounded) instead of skipping the round.
@@ -1018,7 +1695,11 @@ if command -v flock >/dev/null 2>&1; then
   done
   [ "$_fl_i" -ge 60 ] && log "WARN flock $NG_FLOCK still held after 60s, continuing (F33)"
 else
+  # F44: say it out loud. The round proceeds on the mkdir lock alone; the only
+  # thing lost is the F33 mutual exclusion with a 05:10 selfupdate, which is a
+  # narrow window compared with losing every round forever.
   exec 9>/dev/null 2>/dev/null
+  log "WARN deploy lock $NG_FLOCK unavailable (open failed or flock missing), continuing on the mkdir lock only cause=FLOCK_UNAVAILABLE"
 fi
 # F16: log trim runs inside the critical section (see note above).
 [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 204800 ] && tail -400 "$LOG" > "$LOG.$$.new" && mv "$LOG.$$.new" "$LOG"
@@ -1051,12 +1732,122 @@ case "$FAIL_N"  in ''|*[!0-9]*) FAIL_N=0 ;; esac
 case "$PREV_BPS" in ''|*[!0-9]*) PREV_BPS=0 ;; esac
 case "$LAST_TS" in ''|*[!0-9]*) LAST_TS=0 ;; esac
 case "$RACE_TS" in ''|*[!0-9]*) RACE_TS=0 ;; esac
+# F43 (v9.21): the state file is the most likely carrier of a leading zero
+# (restored backup, hand edit, an older tool). The four fields below are all
+# used inside $(( )) - FAIL_N+=1, NOW-LAST_TS, NOW-RACE_TS, and PREV_BPS in the
+# EMA/spike maths - so "v9:08:..." or "PREV_BPS=0100000" aborts or corrupts the
+# round. Measured on v9.20 (p46): FAIL_N=08 + one mild hit -> rc=2 and the log
+# stops mid-round; PREV_BPS=0100000 -> baseline read as octal 32768 and the F26
+# spike rule then rejects every honest sample forever.
+nnall FAIL_N LAST_TS RACE_TS PREV_BPS
+# F45 (v9.21): the character-set guard above accepts a 20-digit field, and an
+# out-of-range value then fails EVERY comparison against it. Measured on v9.21:
+#   PREV_BPS=99999999999999999999 -> the EMA product wraps and the state line is
+#   persisted as PREV_BPS=-40075284104017732 (a NEGATIVE baseline, which silently
+#   disables the whole F26/F34 spike rule from then on).
+#   RACE_TS=99999999999999999999  -> "RACE_TS -gt 0" is false, so the cooldown
+#   gate is skipped entirely; the epoch maths inside $(( )) runs on garbage.
+# Windows: FAIL_N is a 2-hit counter, the two stamps are epochs (10 digits),
+# PREV_BPS is B/s (12 digits = 1 TB/s, far past any tunnel seen).
+nr FAIL_N  5 0
+nr LAST_TS 10 0
+nr RACE_TS 10 0
+nr PREV_BPS 12 0
+# F46 (v9.21): F40 removed the FUTURE-STAMP hazard from the streak file
+# (spk_read) but left it in the state file, which carries TWO stamps with the
+# same class of consequence. Every test on an epoch here is an AGE
+# (NOW-TS), and a negative age fails in the dangerous direction:
+#   RACE_TS > NOW   -> (NOW-RACE_TS) < RACE_CD stays TRUE, so the cooldown
+#                      gate reads "inside cooldown" for however far ahead the
+#                      stamp is (measured: 86400 ahead -> rcd=87299s). A mildly
+#                      degraded cur is then suppressed round after round with
+#                      cause=COOLDOWN_MILD and the guard never races at all
+#                      (D55).
+#   RTS_LOG entries -> the budget purge keeps an entry when
+#                      (now-ts) < RACE_BUDGET_WIN; a negative age is always
+#                      less, so the entry NEVER expires and each one holds a
+#                      budget slot permanently. Two such entries mean
+#                      RACE_BUDGET_H=2 is exhausted forever ("race budget
+#                      exhausted (2/2 in 3600s)" every round, D56).
+#   LAST_TS > NOW   -> (NOW-LAST_TS) > WIN_SEC never fires, so FAIL_N is never
+#                      reset. Rounds days apart then still count as hits inside
+#                      one window and a single blip races immediately, burning
+#                      a slot on noise (D57).
+# Reachable without malice: a clock jump / bad NTP step while a round runs, a
+# state file restored from another machine, or a hand edit. Same policy as F40:
+# a stamp that cannot be about the past is not evidence, so it is DISCARDED -
+# the counter it dates goes with it (a count with no trustworthy timestamp has
+# no window). NOW is the upper bound, not a tolerance: cron rounds are seconds
+# apart and every comparison here is a multi-minute window, so a small skew is
+# harmless while a future stamp is never legitimate.
+[ "$LAST_TS" -gt "$NOW" ] && { FAIL_N=0; LAST_TS=0; }
+[ "$RACE_TS" -gt "$NOW" ] && { RACE_TS=0; }
+# RTS_LOG: keep only entries that are both positive and not in the future
+# (same filter as the budget purge in SECTION 5a, so the two agree).
+RTS_LOG=$(printf '%s' "$RTS_LOG" | tr ',' '\n' | awk -v now="$NOW" '$1+0>0 && $1+0<=now' | tr '\n' ',' | sed 's/,$//')
 # stale mild count outside window is void
 [ "$LAST_TS" -gt 0 ] && [ $((NOW-LAST_TS)) -gt "$WIN_SEC" ] && FAIL_N=0
 # F8: 4th line = PREV_BPS (old 3-line state -> missing -> fallback 0)
 # N1: atomic write - a killed round must not leave a truncated state
 # (half-written line 1 zeroes FAIL_N and resets cooldown/budget).
 save_state(){ printf '%s\n%s\n%s\n%s\n' "v9:$1:$2:$RACE_TS" "LEDGER=$LEDGER" "RTS_LOG=$RTS_LOG" "PREV_BPS=$PREV_BPS" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"; }
+
+# F35 (v9.16): the F34 unstick streak is stored as "N:TS" in tmpfs, so a round
+# that produced no sample cannot donate its count to a later one. The file is
+# deliberately NOT state line 5 (state stays 4 lines) and not a log grep (the
+# log trims to tail-400).
+#
+# The mechanism is CONSUME-AT-START, not just a TTL: the streak is read once and
+# immediately zeroed, here, right after the single-instance lock is held. A round
+# only leaves a nonzero streak behind if it actually reached the EMA block (the
+# only place that writes one). Every early exit - API_DOWN, GROUP_TYPE,
+# READ_FAIL, EXT_CHANGE, manual hold, precheck/screen, a TERM kill - therefore
+# breaks the chain by construction, which is exactly what "consecutive" means.
+# A TTL alone would NOT be enough: cron fires every 300s, so a skipped round
+# inside a 450s window would stay invisible. The TS is kept as a second guard
+# for the one case consume cannot cover (a file planted by hand or by an older
+# script version), and legacy bare-number files are dropped as unverifiable.
+SPK_DEF=/var/run/nodeguard.spk
+SPK_CARRY=0
+spk_write(){ printf '%s:%s' "$1" "$NOW" > "${NG_SPK:-$SPK_DEF}" 2>/dev/null; }
+spk_read(){
+  _sf="${NG_SPK:-$SPK_DEF}"; _n=0
+  case "$SPK_TTL" in ''|*[!0-9]*) SPK_TTL=450 ;; esac
+  [ -f "$_sf" ] && _n=$(cat "$_sf" 2>/dev/null)
+  case "$_n" in
+    *:*)
+      _ts=${_n#*:}; _n=${_n%%:*}
+      case "$_n"  in ''|*[!0-9]*) _n=0 ;; esac
+      case "$_ts" in ''|*[!0-9]*) _ts=0 ;; esac
+      # F43 (v9.21): NOW-_ts is a $(( )), so "3:08" in the streak file would
+      # abort the round before any traffic. This file is tmpfs and written by
+      # spk_write with plain numbers, but it is hand-editable and survives a
+      # crash, so it gets the same treatment as state.
+      nnall _n _ts
+      # F45: the streak file is tmpfs and survives a crash, and "$NOW-_ts" is a
+      # $(( )). An out-of-range _ts makes the TTL test false (age > TTL never
+      # fires), so the streak would be trusted indefinitely - the exact failure
+      # F40 was written to stop, re-opened by a long number instead of a future
+      # one. _n beyond 3 digits is not a streak any more either.
+      nr _n  3 0
+      nr _ts 10 0
+      [ "$_ts" -gt 0 ] || _n=0
+      [ "$_n" -gt 0 ] && [ "$_ts" -gt 0 ] && [ $((NOW-_ts)) -gt "$SPK_TTL" ] && _n=0
+      # F40 (v9.19): a stamp in the FUTURE has a NEGATIVE age, so the TTL test
+      # above (age > TTL) never fires and the streak would be trusted forever -
+      # a clock jump, a bad NTP step or a hand-planted file could then hand an
+      # unrelated round a half-earned streak and let it re-seed the baseline.
+      # Same rule SUBHEAL already applies (L877: a negative age means the stamp
+      # is not trustworthy, so it is discarded). Measured in sandbox D40 on
+      # v9.18: spk "2:9999999999" was consumed and rewritten instead of dropped.
+      [ "$_n" -gt 0 ] && [ "$_ts" -gt "$NOW" ] && _n=0
+      ;;
+    *) _n=0 ;;   # legacy bare number (v9.15) or garbage: unverifiable -> drop
+  esac
+  echo "$_n"
+}
+SPK_CARRY=$(spk_read)
+spk_write 0
 
 # ============================================================
 # SECTION 2: manual take-over switch, api alive, ledger
@@ -1080,8 +1871,12 @@ fi
 # yields the type, so no second read is needed.
 VER_F=/tmp/ng9_ver.$$
 TYP_F=/tmp/ng9_typ.$$
-curl -s -m 3 -H "$AH" "$API/version" > "$VER_F" 2>/dev/null &
-curl -s -m 3 -H "$AH" "$API/proxies/$(enc "$SEL")" > "$TYP_F" 2>/dev/null &
+# F36a: every background child closes fd 9 (the F33 flock) first. These are
+# reaped by the `wait` below, so they cannot outlive a normal round - but a
+# round killed by TERM in between would orphan them for up to their -m cap
+# while they still held the deploy lock. Closing is free and removes the case.
+( exec 9>&- 2>/dev/null; curl -s -m 3 -H "$AH" "$API/version" > "$VER_F" 2>/dev/null ) &
+( exec 9>&- 2>/dev/null; curl -s -m 3 -H "$AH" "$API/proxies/$(enc "$SEL")" > "$TYP_F" 2>/dev/null ) &
 wait
 VER_RESP=$(cat "$VER_F"); rm -f "$VER_F"
 [ -z "$VER_RESP" ] && { log "WARN mihomo api unreachable, skip cause=API_DOWN"; exit 0; }
@@ -1102,7 +1897,10 @@ case "$SEL_TYPE" in
   "")      log "WARN cannot read group type, skip round cause=GROUP_TYPE"; exit 0 ;;
   *)       log "ERR group [$SEL] type is [$SEL_TYPE] not Selector; stage-1 delay would UNPIN it, REFUSE to run. Fix NG_GROUP_SEL or yaml. cause=GROUP_TYPE"; exit 0 ;;
 esac
-CUR=$(tr ',' '\n' < "$TYP_F" | grep -o '"now":"[^"]*"' | head -n1 | sed 's/^"now":"//; s/"$//'); rm -f "$TYP_F"
+# F39 (v9.19): same class as get_now - the body must not be split on ','.
+# grep -o scans chars, not comma-delimited tokens, so a name carrying a comma
+# survives whole. The trailing rm stays where it was.
+CUR=$(grep -o '"now":"[^"]*"' < "$TYP_F" | head -n1 | sed 's/^"now":"//; s/"$//'); rm -f "$TYP_F"
 now_ok "$CUR" || { log "WARN read selector failed (bad response [$CUR]), skip cause=READ_FAIL"; exit 0; }
 # V1: this get_now is a REAL readback of the group's landing point, so it
 # seeds GROUP_NOW. Every later put_node to the same node can skip its PUT.
@@ -1114,6 +1912,11 @@ if [ "$LEDGER" != "$CUR" ]; then
   # evaluated. Sync ledger, zero the baseline, let next round re-seed.
   log "EXT external change [$LEDGER] -> [$CUR] (manual/panel/restart), ledger synced, baseline reset, no action cause=EXT_CHANGE"
   LEDGER="$CUR"; PREV_BPS=0
+  # F34: the streak is relative to the baseline that is being discarded here;
+  # leaving it behind would let a switch hand the next node a half-earned
+  # re-seed. Cleared explicitly rather than relying on the file being absent.
+  # F35: written through spk_write so the timestamp matches this round.
+  spk_write 0
   save_state "$FAIL_N" "$NOW"
   exit 0
 fi
@@ -1130,14 +1933,20 @@ tlog S2
 G_F=/tmp/ng9_g.$$
 R_F=/tmp/ng9_r.$$
 B_F=/tmp/ng9_b.$$
-( google_check > "$G_F" ) &
-( curl -s -o /dev/null -w "%{http_code}" -m 5 "https://www.gstatic.com/generate_204" > "$R_F" 2>/dev/null ) &
-( speed_once > "$B_F" ) &
+( exec 9>&- 2>/dev/null; google_check > "$G_F" ) &
+( exec 9>&- 2>/dev/null; curl -s -o /dev/null -w "%{http_code}" -m 5 "https://www.gstatic.com/generate_204" > "$R_F" 2>/dev/null ) &
+( exec 9>&- 2>/dev/null; speed_once > "$B_F" ) &
 wait
 G=$(cat "$G_F"); rm -f "$G_F"
 R204=$(cat "$R_F"); rm -f "$R_F"
 BEST_BPS=$(cat "$B_F"); rm -f "$B_F"
 [ -z "$BEST_BPS" ] && BEST_BPS=0
+# F45 (v9.21): BEST_BPS is curl's %{speed_download} cut at the decimal point, so
+# it is normally a plain integer - but it is the OTHER operand of every EMA
+# product and of the DROP percentage. A 20-digit reading (a wrapped counter, a
+# proxy injecting a huge sample) makes those products wrap; the public fallback
+# is the only sane answer. 12 digits = 1 TB/s.
+nr BEST_BPS 12 0
 SUSPECT=0
 [ "$R204" != "204" ] && SUSPECT=1
 [ "$BEST_BPS" -lt "$THRESH_BPS" ] && SUSPECT=1
@@ -1158,6 +1967,15 @@ GW=$(google_word "$G")
 if [ "$PREV_BPS" -eq 0 ]; then
   PREV_BPS=$(grep -F "OK [$CUR]" "$LOG" 2>/dev/null | tail -1 | sed 's/.*bps=//;s/ .*//')
   case "$PREV_BPS" in ''|*[!0-9]*) PREV_BPS=0 ;; esac
+  # F43 (v9.21): the log is user-visible and hand-restorable, and the line this
+  # greps (a v9.x "OK [...] bps=NNN") is trivially forgeable. The very next
+  # $(( )) divides by PREV_BPS after multiplying it, so "bps=080000" would
+  # either abort the round (8 is not octal) or silently run on 32768.
+  nn PREV_BPS
+  # F45 (v9.21): the log fallback is the same hostile input as the state field -
+  # a forged or truncated "bps=<20 digits>" line. Without the window the EMA
+  # product wraps and the baseline goes negative (measured harm, see nr()).
+  nr PREV_BPS 12 0
 fi
 if [ "$PREV_BPS" -gt 0 ] && [ "$BEST_BPS" -gt 0 ]; then
   DROP=$(( (PREV_BPS - BEST_BPS) * 100 / PREV_BPS ))
@@ -1173,23 +1991,79 @@ if [ "$RACE_TS" -gt 0 ] && [ $((NOW-RACE_TS)) -lt "$RACE_CD" ]; then REM=$((RACE
 # spikes and do not touch it at all. Integer math only; case $EMA_* guards
 # against garbage conf values. v9.10 behaviour (plain overwrite) is available
 # by setting EMA_A=0 EMA_CAP=10000 EMA_SPIKE=1000000.
+#
+# F34 (v9.15) RATCHET ESCAPE. The F26 spike rule assumed a high sample is a
+# one-off burst and the baseline is "about right". That assumption breaks the
+# moment the baseline itself is physically too low: if PREV_BPS is stuck below
+# the real capability, EVERY honest sample is >EMA_SPIKE% of it and is thrown
+# away, so the baseline can never climb back. Measured on the live router
+# (2026-11-27): a single bad reading pinned PREV_BPS=16393; the node's actual
+# 5MB throughput was 180-360KB/s; the 108KB probe read 46-122KB/s; 196 F26
+# rejections accumulated in the log and not one of them moved the baseline.
+# Consequence: SPIKE_FLAG compares the current sample to a permanently tiny
+# bar, so a genuine deceleration of a healthy node is misread as "spike not
+# confirmed", which suppresses the switch decision (COOLDOWN_MILD /
+# SPIKE_WAIT paths). The guard gets stuck on a node it would otherwise leave.
+# Fix: allow the baseline to escape, but keep F26's anti-burst protection. A
+# sample above SPK_LIM is only accepted as a new baseline when the baseline has
+# proven to be a floor rather than a level, i.e. when the previous F26 streaks
+# (consecutive rejections in a row) reached EMA_UNSTICK (default 3). On escape
+# the baseline is re-seeded with the capped value (CAP_LIM applied against the
+# OLD baseline, so escape is still gradual), and the streak resets. A genuine
+# one-off burst therefore still cannot move the baseline, because the streak
+# counter has to be earned by repeated high samples first.
 if [ "$BEST_BPS" -gt 0 ] 2>/dev/null; then
   if [ "$PREV_BPS" -gt 0 ] 2>/dev/null; then
     case "$EMA_A"    in ''|*[!0-9]*) EMA_A=80 ;; esac
     case "$EMA_CAP"  in ''|*[!0-9]*) EMA_CAP=125 ;; esac
     case "$EMA_SPIKE" in ''|*[!0-9]*) EMA_SPIKE=300 ;; esac
+    case "$EMA_UNSTICK" in ''|*[!0-9]*) EMA_UNSTICK=3 ;; esac
+    [ "$EMA_UNSTICK" -lt 1 ] && EMA_UNSTICK=1
+    case "$SPK_TTL" in ''|*[!0-9]*) SPK_TTL=450 ;; esac
+    SPK_N=$SPK_CARRY
     SPK_LIM=$(( PREV_BPS * EMA_SPIKE / 100 ))
+    CAP_LIM=$(( PREV_BPS * EMA_CAP / 100 ))
     if [ "$BEST_BPS" -gt "$SPK_LIM" ]; then
-      log "  F26 spike ignored: sample ${BEST_BPS}B/s > ${EMA_SPIKE}% of baseline ${PREV_BPS}B/s, baseline kept"
+      SPK_N=$((SPK_N+1))
+      if [ "$SPK_N" -ge "$EMA_UNSTICK" ]; then
+        # F34: baseline proven to be a floor -> take the sample as-is. No
+        # EMA_CAP clipping here on purpose: clipping against the (wrongly low)
+        # old baseline would need many rounds to converge, which is the bug
+        # being fixed. Three consecutive high samples are the evidence.
+        PREV_BPS=$BEST_BPS
+        log "  F34 baseline re-seeded ${PREV_BPS}B/s after ${SPK_N} consecutive rejections (was stuck below real capability)"
+        SPK_N=0
+      else
+        log "  F26 spike ignored: sample ${BEST_BPS}B/s > ${EMA_SPIKE}% of baseline ${PREV_BPS}B/s, baseline kept (streak ${SPK_N}/${EMA_UNSTICK})"
+      fi
     else
-      CAP_LIM=$(( PREV_BPS * EMA_CAP / 100 ))
+      # Normal path: unchanged v9.11 EMA. The DOWN direction is deliberately
+      # NOT capped - EMA_A already limits a single step to (100-EMA_A)% and a
+      # real deceleration must be tracked at that speed. An earlier draft of
+      # F34 added a symmetric floor here; measurement showed it slowed genuine
+      # deceleration ~5x (200000->16000 needs 11 rounds unclamped, 63 clamped)
+      # and solved nothing the streak escape does not, so it was removed.
+      SPK_N=0
       SAMPLE=$BEST_BPS
       [ "$SAMPLE" -gt "$CAP_LIM" ] && { SAMPLE=$CAP_LIM; }
       PREV_BPS=$(( (PREV_BPS * EMA_A + SAMPLE * (100 - EMA_A)) / 100 ))
     fi
+    spk_write "$SPK_N"
   else
+    # No baseline yet: seed from this round's sample (unchanged v9.11 policy).
+    # SPK_N is reset here on purpose - the streak only means anything relative
+    # to an existing baseline, and PREV_BPS is zeroed on EXT_CHANGE and on a
+    # confirmed switch, so a stale streak must not survive that.
     PREV_BPS=$BEST_BPS
+    spk_write 0
   fi
+else
+  # F35: a round with no usable sample proves nothing about the streak, so it
+  # must not carry it forward. Explicit zero (not just TTL) keeps the common
+  # path honest: two isolated bursts separated by a dead probe are NOT two
+  # consecutive rejections. Without this the counter was "however many
+  # rejections ever happened", and one burst could re-seed the baseline.
+  spk_write 0
 fi
 log "OK [$CUR] google=$GW 204=$R204 bps=$BEST_BPS fail=${FAIL_N}/${FAIL_TRIGGER} rcd=${REM}s spike=${SPIKE_FLAG}"
 tlog S3
@@ -1276,8 +2150,9 @@ TYPE_F=/tmp/ng9_types.$$
 GRP_F=/tmp/ng9_grps.$$
 DLY_F=/tmp/ng9_delay.$$
 TYPE_N=0
-curl -s -m 15 -H "$AH" "$API/group/$SELU/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=3000" > "$DLY_F" 2>/dev/null &
-curl -s -m 15 -H "$AH" "$API/providers/proxies" 2>/dev/null | tr '{' '\n' | awk -v t="$PROV_TYPES" '
+# F36a: drop the inherited flock fd in each S5 probe (see the S2 note).
+( exec 9>&- 2>/dev/null; curl -s -m 15 -H "$AH" "$API/group/$SELU/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=3000" > "$DLY_F" 2>/dev/null ) &
+( exec 9>&- 2>/dev/null; curl -s -m 15 -H "$AH" "$API/providers/proxies" 2>/dev/null | tr '{' '\n' | awk -v t="$PROV_TYPES" '
   BEGIN { n = split(t, a, "|"); for (i=1;i<=n;i++) w[a[i]] = 1 }
   {
     n1 = index($0, "\"name\":\""); if (!n1) next
@@ -1285,10 +2160,10 @@ curl -s -m 15 -H "$AH" "$API/providers/proxies" 2>/dev/null | tr '{' '\n' | awk 
     t1 = index($0, "\"type\":\""); if (!t1) next
     r2 = substr($0, t1+8); t2 = index(r2, "\""); if (!t2) next; typ = substr(r2, 1, t2-1)
     if (w[typ]) print name "\t" typ
-  }' > "$TYPE_F" &
-curl -s -m 10 -H "$AH" "$API/proxies" 2>/dev/null \
+  }' > "$TYPE_F" ) &
+( exec 9>&- 2>/dev/null; curl -s -m 10 -H "$AH" "$API/proxies" 2>/dev/null \
   | tr '{' '\n' | grep -o '"name":"[^"]*"' | sed 's/^"name":"//; s/"$//' \
-  | sort -u > "$GRP_F" &
+  | sort -u > "$GRP_F" ) &
 wait
 DELAY_JSON=$(cat "$DLY_F"); rm -f "$DLY_F"
 if [ -z "$DELAY_JSON" ]; then
@@ -1298,14 +2173,42 @@ if [ -z "$DELAY_JSON" ]; then
   log "ERR screen no response, keep [$CUR] cause=SCREEN_NORESP"; save_state "$FAIL_N" "$NOW"; exit 0
 fi
 
-# parse layer 0: last-colon split (v8 rules)
+# parse layer 0: quote-aware top-level split, then last-colon split (v8 rules)
 # layer 1: keyword junk filter (v8 rules, kept as defense in depth:
 #          billing/info nodes share protocol types, keywords still needed)
 # layer 2 (M5): keep only protocol-typed real nodes from providers API;
 #          groups / DIRECT / REJECT are excluded by type, not by name guessing
+# F39 (v9.19): the old form was
+#   sed 's/"//g' | tr ',' '\n' | awk -F: '...'
+# which split the body on EVERY comma, including commas inside a node name.
+# "JP-01,HK-02":110 tore into `"JP-01` + `HK-02":110`, so the pool held a
+# phantom node `HK-02` (and lost the real one); racing it PUTs a name that does
+# not exist. Measured in sandbox D37 on v9.18 (READ_FAIL every round).
+# Fix: scan the body for `"name":digits` pairs instead of splitting on commas.
+# [^"]* crosses commas, so a whole quoted name is matched regardless of its
+# contents; the value must be all digits, which is the same junk filter v8 had
+# (null / nested objects / info text never match). The separator is the FIRST
+# `":` after the opening quote, which is exactly where the name ends (a name
+# carrying a raw quote is escaped as \" and then cannot match this pattern at
+# all - such a name is also rejected by now_ok, so it could never be CUR).
+# Verified on the router: comma name, colon name, space/bracket/rate-tag name
+# all parse, and {"bad":null} / {"x":{"a":5}} emit nothing.
 TYPE_N=$(grep -c . "$TYPE_F" 2>/dev/null)
-TPS_ALL=$(echo "$DELAY_JSON" | sed 's/^[{]*//; s/[}]*$//; s/"//g' | tr ',' '\n' \
-  | awk -F: 'BEGIN{OFS=":"} NF>1 && $NF ~ /^[0-9]+$/ { d=$NF; NF--; print d "\t" $0 }' \
+TPS_ALL=$(echo "$DELAY_JSON" | awk '
+  {
+    s = $0
+    while (match(s, /[{,][ \t]*"[^"\\]*":[0-9]+/)) {
+      m = substr(s, RSTART, RLENGTH)
+      s = substr(s, RSTART + RLENGTH)
+      sub(/^[{,][ \t]*"/, "", m)
+      p = index(m, "\":")
+      if (p > 1) {
+        nm = substr(m, 1, p - 1)
+        dv = substr(m, p + 2)
+        if (nm != "" && dv ~ /^[0-9]+$/) printf "%s\t%s\n", dv, nm
+      }
+    }
+  }' \
   | grep -v -e 'DIRECT' -e '自动选择' -e '其他地区' -e '建议' -e '订阅' \
             -e '官网' -e '剩余' -e '重置' -e '到期' -e '套餐' -e '：' \
             -e '倍率' -e '勿跑' -e '过期' -e '失联' )
@@ -1412,7 +2315,7 @@ fi
 #     it would only trim the all-dead round (ceiling 281s, normally far
 #     shorter; see trade-off 2, v9.9-corrected) at the price of
 # a second probe path kept in sync with the stage-2 gates. Not done here.
-RTS_LOG=$(printf '%s' "$RTS_LOG" | tr ',' '\n' | awk -v now="$NOW" -v w="$RACE_BUDGET_WIN" '$1+0>0 && now-$1<w' | tr '\n' ',' | sed 's/,$//')
+RTS_LOG=$(printf '%s' "$RTS_LOG" | tr ',' '\n' | awk -v now="$NOW" -v w="$RACE_BUDGET_WIN" '$1+0>0 && $1+0<=now && now-$1<w' | tr '\n' ',' | sed 's/,$//')
 N_RECENT=$(printf '%s' "$RTS_LOG" | awk -F, 'NF>0{n=NF} END{print n+0}')
 if [ "$N_RECENT" -ge "$RACE_BUDGET_H" ]; then
   log "WARN [$CUR] race budget exhausted (${N_RECENT}/${RACE_BUDGET_H} in ${RACE_BUDGET_WIN}s), keep cur cause=BUDGET"
@@ -1497,6 +2400,22 @@ egress_trace(){
 SAVED_IFS=$IFS
 IFS='
 '
+# F42 (v9.19): the finalist loop below is `for N in $RACE_LIST`, an UNQUOTED
+# word list, so the shell applies PATHNAME EXPANSION to every word. IFS=newline
+# only stops field splitting on spaces; it does NOT stop globbing. A node name
+# containing '*' or a bracket expression is therefore replaced by whatever files
+# happen to match it in the current directory ($RACE_RES is created in /tmp, and
+# a crontab round runs with cwd=/, so the matches come from the real filesystem).
+# Measured in sandbox probe p41b2 on busybox ash: with files HK1V1 and N3
+# present, the list "HK*V1\nN3" yielded the word HK1V1 instead of HK*V1, and a
+# bare "*" exploded into one word per file in the directory (extra words = extra
+# candidates, and the real node silently vanished from the race). Real airport
+# names do carry rate tags such as "1.5x" and, less often, "*" / "[" - the same
+# name-assumption class as F38/F39.
+# set -f turns globbing off for the whole race section; field splitting on
+# newline is unchanged, so the loop still walks one name per line exactly as
+# intended. Restored together with IFS below.
+set -f
 : > "$RACE_RES"
 
 # 6a) measure current node - V7 (v9.10): REUSES the S3 samples instead of
@@ -1631,8 +2550,8 @@ for N in $RACE_LIST; do
   # median is unaffected. Ceiling max(6, 2*SPEED_MAX) instead of 6+2*SPEED_MAX.
   CG_F=/tmp/ng9_cg.$$
   MS_F=/tmp/ng9_ms.$$
-  ( google_check > "$CG_F" ) &
-  ( speed_med > "$MS_F" ) &
+  ( exec 9>&- 2>/dev/null; google_check > "$CG_F" ) &
+  ( exec 9>&- 2>/dev/null; speed_med > "$MS_F" ) &
   wait
   CG=$(cat "$CG_F"); rm -f "$CG_F"
   if [ "$CG" = "2" ]; then
@@ -1651,6 +2570,9 @@ for N in $RACE_LIST; do
   log "  cand [$N] ok204=${OK204}/${TRY204} google=$(google_word $CG) thr=${MED}B/s stab=${STB} loss=${LOSS} jit=${JITTER}ms lat=${LAT}ms"
 done
 IFS=$SAVED_IFS
+# F42: restore globbing only together with IFS, i.e. after the last unquoted
+# word list has been walked.
+set +f
 tlog 6b
 
 # ============================================================
@@ -1874,6 +2796,9 @@ log "ACT switch [$CUR] -> [$BEST_NODE] score ${CUR_SCORE}->${BEST_SCORE} [confir
 # the baseline could never rise. Zero it (same policy as EXT_CHANGE) so next
 # round re-seeds from a real measurement of the node actually in seat.
 PREV_BPS=0
+# F34: also clear the unstick streak - it belongs to the baseline just dropped.
+# F35: written through spk_write so the timestamp matches this round.
+spk_write 0
 egress_trace
 
 rm -f "$RACE_RES" "$SCORED"
